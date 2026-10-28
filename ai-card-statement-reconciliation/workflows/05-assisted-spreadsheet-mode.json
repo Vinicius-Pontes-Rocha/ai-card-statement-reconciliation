@@ -1,0 +1,177 @@
+{
+  "name": "05-assisted-spreadsheet-mode",
+  "nodes": [
+    {
+      "name": "Enviar fatura do cartão",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "authentication": "basicAuth",
+        "formTitle": "Fatura do cartão - clientes do Conta Azul Mais",
+        "formDescription": "Escolha o cliente e envie o PDF da fatura. O robô lê todas as linhas, confere com o total impresso e monta a planilha pronta (data da compra, descrição, fornecedor e categoria) para lançar no Conta Azul. Ele não lança nada sozinho.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Cliente",
+              "fieldName": "cliente",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Redacted Contabilidade"
+                  },
+                  {
+                    "option": "Redacted"
+                  },
+                  {
+                    "option": "Redacted"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "PDF da fatura",
+              "fieldName": "fatura",
+              "fieldType": "file",
+              "multipleFiles": false,
+              "acceptFileTypes": ".pdf",
+              "requiredField": true
+            }
+          ]
+        },
+        "options": {
+          "path": "fatura-conta-azul-mais",
+          "buttonLabel": "Enviar",
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpBasicAuth"
+        }
+      }
+    },
+    {
+      "name": "Juntar arquivos para a IA",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const bin = $input.item.binary || {};\nconst keys = Object.keys(bin);\nif (!keys.length) throw new Error('Nenhum arquivo recebido.');\nconst parts = [];\nfor (const k of keys) {\n  const buf = await this.helpers.getBinaryDataBuffer($itemIndex, k);\n  parts.push({ inline_data: { mime_type: bin[k].mimeType || 'application/pdf', data: buf.toString('base64') } });\n}\nconst prompt = [\n  'Você é um assistente contábil. O arquivo acima é o PDF de UMA fatura de cartão de crédito.',\n  'Liste TODOS os lançamentos DESTA fatura, na ordem em que aparecem, de TODOS os cartões (titular e adicionais). Devolva SOMENTE JSON válido (sem markdown).',\n  'Regras:',\n  '- IGNORE o pagamento da fatura anterior (\"Pagamento Recebido\", \"Pagamento efetuado\", \"Obrigado pelo pagamento\") e o saldo/total da fatura anterior: coloque em pagamentos_ignorados.',\n  '- NÃO inclua linhas de subtotal/total. Não pule nem junte linhas. Estornos e créditos entram com valor NEGATIVO.',\n  '- data: a data impressa na linha (DD/MM) = data da compra. parcela: \"N/T\" se aparecer \"Parcela N de T\", \"NN/TT\" ou \"N DE T\" junto da descrição, senão \"\". ATENÇÃO: \"03/12\" no fim da descrição é PARCELA, não data.',\n  '- descricao: texto do estabelecimento exatamente como aparece. valor: número com ponto decimal, em R$ (compra internacional: use o valor em R$).',\n  '- vencimento: data de vencimento desta fatura (AAAA-MM-DD). total_impresso: o TOTAL A PAGAR desta fatura.',\n  '- CONFERÊNCIA: a soma dos valores deve bater com total_impresso; se não bater, releia antes de responder.',\n  '- Se não tiver certeza de alguma linha, inclua e explique em duvidas.',\n  'Formato: {\"vencimento\":\"AAAA-MM-DD\",\"total_impresso\":0,\"lancamentos\":[{\"data\":\"DD/MM\",\"descricao\":\"\",\"valor\":0,\"parcela\":\"\"}],\"pagamentos_ignorados\":[{\"descricao\":\"\",\"valor\":0}],\"duvidas\":[]}'\n].join('\\n');\nparts.push({ text: prompt });\nreturn { json: { arquivos: keys.length, body: { contents: [{ parts }], generationConfig: { responseMimeType: 'application/json', temperature: 0 } } } };"
+      }
+    },
+    {
+      "name": "IA - Gemini lê a fatura",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        448,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpHeaderAuth"
+        }
+      }
+    },
+    {
+      "name": "Montar planilha e relatório",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const fm = $('Enviar fatura do cartão').first().json;\nconst cliente = fm.cliente || 'Cliente';\nconst raw = ($input.first().json.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');\nif (!raw.trim()) throw new Error('A IA não devolveu nada.');\nlet f; try { f = JSON.parse(raw); } catch (e) { f = JSON.parse(raw.replace(/^\\s*```(json)?/i, '').replace(/```\\s*$/, '').trim()); }\nconst venc = /^\\d{4}-\\d{2}-\\d{2}/.test(String(f.vencimento || '')) ? String(f.vencimento).slice(0, 10) : '';\nconst vy = venc ? Number(venc.slice(0, 4)) : new Date().getFullYear();\nconst toISO = t => { const m = String(t || '').match(/(\\d{1,2})\\s*\\/\\s*(\\d{1,2})(?:\\s*\\/\\s*(\\d{2,4}))?/); if (!m) return ''; const d = m[1].padStart(2, '0'), mo = m[2].padStart(2, '0');\n  if (m[3]) return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + mo + '-' + d; let iso = vy + '-' + mo + '-' + d; if (venc && iso > venc) iso = (vy - 1) + '-' + mo + '-' + d; return iso; };\nconst br = iso => iso ? iso.split('-').reverse().join('/') : '';\nconst r2 = v => Math.round(Number(v) * 100) / 100, cents = v => Math.round(Number(v) * 100);\nconst brl = v => Number(v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().replace(/[^A-Z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();\n// Sugestão de categoria por palavra (a Redacted confere). Ajustar com o padrão de cada cliente.\nconst REGRAS = [\n  [/ANUIDADE|TARIFA|IOF|JUROS|ENCARGO/, 'Tarifas bancárias / cartão'],\n  [/IFD|IFOOD|RESTAUR|LANCH|PADARIA|CAFE|BOLO/, 'Alimentação'],\n  [/UBER|99 ?APP|POSTO|COMBUST|ESTACION/, 'Transporte / combustível'],\n  [/OLX|ANUNCI|FACEBK|FACEBOOK|GOOGLE ADS|INSTAGRAM/, 'Marketing / anúncios'],\n  [/GOOGLE|MICROSOFT|ADOBE|CANVA|APPLE|OPENAI|ZOOM/, 'Sistemas e aplicativos'],\n  [/MERCADOLIVRE|MERCADO LIVRE|MAGALU|AMAZON|SHOPEE|PRODUTOS|SONHOEARTE/, 'Compras / materiais (a classificar)'],\n  [/COLCHO|MOVEIS|MOVEL/, 'Móveis e utensílios (a classificar)'],\n  [/ASSISTENCIA|LETZTECH|INFORMAT|TECH/, 'Manutenção / tecnologia (a classificar)']\n];\nconst PREF = /^(MP|ZP|EC|PG|PAG|IFD|DL|EBN|WWW|JIM)\\s*\\*?\\s*/i;\nconst linhas = (f.lancamentos || []).filter(l => cents(l.valor) !== 0).map((l, i) => {\n  const descricao = String(l.descricao || '').trim();\n  const p = String(l.parcela || '').match(/(\\d{1,2})\\s*\\/\\s*(\\d{1,2})/);\n  const r = REGRAS.find(([re]) => re.test(norm(descricao)));\n  const fornecedor = descricao.replace(PREF, '').replace(/\\*/g, ' ').replace(/\\s+/g, ' ').trim().toUpperCase();\n  return { n: i + 1, dataCompra: toISO(l.data), descricao, parcela: p ? p[1] + '/' + p[2] : '', valor: r2(l.valor), credito: Number(l.valor) < 0,\n    fornecedor, categoria: r ? r[1] : 'A classificar', descricaoCA: (p ? p[1] + '/' + p[2] + ' - ' : '') + descricao.toUpperCase() };\n});\nconst soma = r2(linhas.reduce((s, l) => s + l.valor, 0));\nconst total = f.total_impresso !== null && f.total_impresso !== undefined && f.total_impresso !== '' ? r2(f.total_impresso) : null;\nconst bate = total === null ? null : cents(total) === cents(soma);\nconst cab = ['Data da compra (competência)', 'Vencimento', 'Descrição', 'Parcela', 'Fornecedor (sugestão)', 'Categoria (sugestão)', 'Tipo', 'Valor'];\nconst csvLinhas = linhas.map(l => [br(l.dataCompra), br(venc), l.descricaoCA, l.parcela, l.fornecedor, l.categoria, l.credito ? 'Receita/estorno' : 'Despesa', String(Math.abs(l.valor).toFixed(2)).replace('.', ',')]);\nconst csv = '﻿' + [cab].concat(csvLinhas).map(r => r.map(c => '\"' + String(c).replace(/\"/g, '\"\"') + '\"').join(';')).join('\\r\\n');\nconst csvB64 = Buffer.from(csv, 'utf8').toString('base64');\nconst td = 'style=\"padding:4px 6px;border-bottom:1px solid #ddd;font-size:12px;vertical-align:top\"', tdr = 'style=\"padding:4px 6px;border-bottom:1px solid #ddd;font-size:12px;text-align:right;white-space:nowrap\"', th = 'style=\"padding:4px 6px;border-bottom:2px solid #333;font-size:12px;text-align:left\"';\nconst card = (t, v, cor) => '<div style=\"display:inline-block;margin:4px;padding:8px 12px;border:1px solid #ccc;border-radius:6px;min-width:120px\"><div style=\"font-size:11px;color:#555\">' + t + '</div><div style=\"font-size:18px;font-weight:bold;color:' + (cor || '#222') + '\">' + v + '</div></div>';\nlet h = '<div style=\"font-family:Arial,sans-serif;text-align:left;max-width:1100px;margin:auto\"><h2 style=\"margin:4px 0\">' + esc(cliente) + ' — fatura do cartão venc. ' + (br(venc) || '(não encontrado no PDF)') + '</h2>';\nh += '<p style=\"font-size:13px\">' + (bate === true ? '<b style=\"color:#1b7f3b\">✅ A soma das linhas bate com o total da fatura (' + brl(total) + ').</b>' : bate === false ? '<b style=\"color:#c0392b\">⚠️ A soma (' + brl(soma) + ') NÃO bate com o total da fatura (' + brl(total) + '). Diferença ' + brl(soma - total) + ' — confira se alguma linha foi lida errado.</b>' : '<b style=\"color:#b26a00\">Não achei o total no PDF: confira a soma abaixo.</b>') + '</p>';\nh += '<div>' + card('Lançamentos', linhas.length) + card('Soma', brl(soma), bate === false ? '#c0392b' : bate ? '#1b7f3b' : '#222') + card('Total da fatura', total === null ? '?' : brl(total)) + card('Pagamentos ignorados', (f.pagamentos_ignorados || []).length, '#666') + '</div>';\nif ((f.duvidas || []).filter(Boolean).length) h += '<p style=\"color:#b26a00;font-size:12px\"><b>Dúvidas da leitura:</b> ' + f.duvidas.filter(Boolean).map(esc).join(' | ') + '</p>';\nh += '<p><a download=\"' + esc(cliente) + ' fatura ' + br(venc).replace(/\\//g, '-') + '.csv\" href=\"data:text/csv;base64,' + csvB64 + '\" style=\"display:inline-block;padding:10px 16px;background:#1b7f3b;color:#fff;border-radius:6px;text-decoration:none;font-weight:bold\">⬇ Baixar planilha (Excel)</a></p>';\nh += '<table style=\"border-collapse:collapse;width:100%\"><tr><th ' + th + '>#</th><th ' + th + '>Data compra</th><th ' + th + '>Descrição para o Conta Azul</th><th ' + th + '>Fornecedor (sugestão)</th><th ' + th + '>Categoria (sugestão)</th><th ' + th + '>Valor</th></tr>';\nlinhas.forEach(l => { h += '<tr><td ' + td + '>' + l.n + '</td><td ' + td + '>' + br(l.dataCompra) + '</td><td ' + td + '>' + esc(l.descricaoCA) + '</td><td ' + td + '>' + esc(l.fornecedor) + '</td><td ' + td + '>' + esc(l.categoria) + '</td><td ' + tdr + '>' + (l.credito ? '<span style=\"color:#1b7f3b\">estorno ' + brl(Math.abs(l.valor)) + '</span>' : brl(l.valor)) + '</td></tr>'; });\nh += '</table>';\nif ((f.pagamentos_ignorados || []).length) h += '<p style=\"font-size:12px;color:#666\">Pagamentos de fatura ignorados: ' + f.pagamentos_ignorados.map(p => esc(p.descricao) + ' ' + brl(p.valor)).join(' | ') + '</p>';\nh += '<p style=\"font-size:11px;color:#888\">Nada foi lançado: confira e lance no Conta Azul.</p></div>';\nreturn [{ json: { cliente, vencimento: venc, soma, total, bate, linhas, pagamentos: f.pagamentos_ignorados || [], duvidas: f.duvidas || [], html: h } }];"
+      }
+    },
+    {
+      "name": "Mostrar planilha",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        896,
+        0
+      ],
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $json.html }}"
+      }
+    }
+  ],
+  "connections": {
+    "Enviar fatura do cartão": {
+      "main": [
+        [
+          {
+            "node": "Juntar arquivos para a IA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Juntar arquivos para a IA": {
+      "main": [
+        [
+          {
+            "node": "IA - Gemini lê a fatura",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IA - Gemini lê a fatura": {
+      "main": [
+        [
+          {
+            "node": "Montar planilha e relatório",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar planilha e relatório": {
+      "main": [
+        [
+          {
+            "node": "Mostrar planilha",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

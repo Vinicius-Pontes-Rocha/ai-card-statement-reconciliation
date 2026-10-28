@@ -1,0 +1,49 @@
+{
+  "name": "06-oauth-redirect-fix",
+  "nodes": [
+    {
+      "name": "Recebe pedido de autorizacao",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "contaazul-authorize",
+        "authentication": "none",
+        "responseMode": "responseNode"
+      }
+    },
+    {
+      "name": "Redireciona para login Conta Azul",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        224,
+        0
+      ],
+      "parameters": {
+        "respondWith": "redirect",
+        "redirectURL": "={{ 'https://login.contaazul.com/#/oauth/authorize?' + Object.entries($json.query).map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&') }}"
+      }
+    }
+  ],
+  "connections": {
+    "Recebe pedido de autorizacao": {
+      "main": [
+        [
+          {
+            "node": "Redireciona para login Conta Azul",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

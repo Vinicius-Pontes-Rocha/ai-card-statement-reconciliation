@@ -1,0 +1,783 @@
+{
+  "name": "03-reconcile-erp-b",
+  "nodes": [
+    {
+      "name": "Enviar fatura do cartão",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "formTitle": "Conferência da fatura do cartão - Redacted Redacted (Omie)",
+        "formDescription": "Envie o PDF da fatura. O robô lê todas as linhas e confere com o Omie. Em 'Conferir e LANÇAR', ele lança no Omie só o que estiver faltando (nunca apaga nem altera nada).",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Cartão",
+              "fieldName": "cliente",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Redacted Redacted - Sicredi"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "Fatura (PDF)",
+              "fieldName": "fatura",
+              "fieldType": "file",
+              "multipleFiles": false,
+              "acceptFileTypes": ".pdf",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "O que fazer",
+              "fieldName": "acao",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Só conferir (não grava nada)"
+                  },
+                  {
+                    "option": "Conferir e LANÇAR no Omie"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "authentication": "basicAuth",
+        "options": {
+          "buttonLabel": "Enviar",
+          "path": "conferir-fatura-Redacted-Redacted",
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpBasicAuth"
+        }
+      }
+    },
+    {
+      "name": "Config do cliente + PDF",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Cartões da Redacted Redacted REDACTED no Omie (id da conta corrente do cartão)\nconst CARTOES = {\n  'Redacted Redacted - Sicredi': { cc: 00000000000, nome: 'CARTÃO DE CRÉDITO SICREDI REDACTED' },\n  'Redacted Redacted - Caixa': { cc: 00000000000, nome: 'CARTÃO DE CRÉDITO CAIXA REDACTED' }\n};\nconst cliente = $json.cliente;\nconst cfg = CARTOES[cliente];\nif (!cfg) throw new Error('Cartão sem cadastro no robô: ' + cliente);\nconst bin = $input.item.binary || {};\nconst key = Object.keys(bin)[0];\nif (!key) throw new Error('Nenhum PDF recebido no formulário.');\nconst buf = await this.helpers.getBinaryDataBuffer($itemIndex, key);\nconst prompt = [\n  'Você é um assistente contábil. Leia a FATURA DE CARTÃO DE CRÉDITO em PDF e devolva SOMENTE um JSON válido (sem markdown).',\n  'Regras:',\n  '- Liste TODOS os lançamentos de TODOS os cartões (titular e adicionais), nacionais e internacionais, inclusive IOF, anuidade, tarifas, juros, encargos, estornos e créditos.',\n  '- NÃO inclua o pagamento da fatura anterior como lançamento; informe o valor dele em pagamento_fatura_anterior.',\n  '- NÃO inclua linhas de subtotal/total. Não invente nada; não pule linhas; não junte linhas.',\n  '- descricao: copie EXATAMENTE o texto do estabelecimento como impresso, incluindo o número da parcela se vier junto.',\n  '- data: a data da linha exatamente como impressa, no formato DD/MM.',\n  '- valor_brl: valor em REAIS (R$), número com ponto decimal. Compras/débitos positivos; estornos/créditos NEGATIVOS.',\n  '- COMPRAS INTERNACIONAIS: preencha moeda_original, valor_moeda_original, cotacao e valor_brl (o valor em R$). valor_brl NUNCA é o valor em dólar. Compras nacionais: moeda_original BRL, cotacao 1.',\n  '- CONFERÊNCIA OBRIGATÓRIA: a soma de todos os valor_brl deve ser igual a total_fatura. Se não bater, releia as linhas antes de responder.',\n  '- parcela: \"NN/NN\" se a linha for parcelada, senão \"\".',\n  '- final_cartao: 4 últimos dígitos do cartão daquela linha. titular: nome impresso do portador daquele cartão.',\n  '- tipo: um de compra, estorno, iof, anuidade, tarifa, juros, outro.',\n  '- vencimento no formato AAAA-MM-DD. total_fatura = total a pagar desta fatura.',\n  'Formato:',\n  '{\"banco\":\"\",\"vencimento\":\"AAAA-MM-DD\",\"total_fatura\":0,\"pagamento_fatura_anterior\":0,\"cartoes\":[{\"final\":\"\",\"titular\":\"\"}],\"lancamentos\":[{\"data\":\"DD/MM\",\"descricao\":\"\",\"moeda_original\":\"BRL\",\"valor_moeda_original\":0,\"cotacao\":1,\"valor_brl\":0,\"parcela\":\"\",\"final_cartao\":\"\",\"titular\":\"\",\"tipo\":\"compra\",\"internacional\":false}]}'\n].join('\\n');\nreturn { json: { cliente, contaCartaoId: cfg.cc, contaCartaoNome: cfg.nome, arquivo: bin[key].fileName || 'fatura.pdf', prompt, pdf_b64: buf.toString('base64') } };"
+      }
+    },
+    {
+      "name": "IA - Gemini lê a fatura",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        448,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [ { inline_data: { mime_type: 'application/pdf', data: $json.pdf_b64 } }, { text: $json.prompt } ] }], generationConfig: { responseMimeType: 'application/json', temperature: 0 } }) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpHeaderAuth"
+        }
+      }
+    },
+    {
+      "name": "Organizar linhas da fatura",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const raw = ($json.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');\nif (!raw.trim()) throw new Error('A IA não devolveu nada para esta fatura.');\nlet f;\ntry { f = JSON.parse(raw); } catch (e) { f = JSON.parse(raw.replace(/^\\s*```(json)?/i, '').replace(/```\\s*$/, '').trim()); }\nconst cfg = $('Config do cliente + PDF').item.json;\nconst venc = String(f.vencimento || '').slice(0, 10);\nif (!/^\\d{4}-\\d{2}-\\d{2}$/.test(venc)) throw new Error('Não achei o vencimento da fatura: ' + f.vencimento);\nconst vy = Number(venc.slice(0, 4));\n// Aceita \"24/09\", \"24/set\", \"24 SET\", \"24/09/2026\" e \"2026-09-24\"\nconst MESES = { jan: 1, fev: 2, mar: 3, abr: 4, mai: 5, jun: 6, jul: 7, ago: 8, set: 9, out: 10, nov: 11, dez: 12 };\nconst toISO = txt => {\n  const s = String(txt || '').trim().toLowerCase();\n  let m = s.match(/^(\\d{4})-(\\d{2})-(\\d{2})/);\n  if (m) return m[1] + '-' + m[2] + '-' + m[3];\n  m = s.match(/(\\d{1,2})\\s*[\\/\\-. ]\\s*([a-zç]{3,}|\\d{1,2})(?:\\s*[\\/\\-. ]\\s*(\\d{2,4}))?/);\n  if (!m) return '';\n  const mesN = /\\d/.test(m[2]) ? Number(m[2]) : MESES[m[2].slice(0, 3)];\n  if (!mesN) return '';\n  const d = m[1].padStart(2, '0'), mo = String(mesN).padStart(2, '0');\n  if (m[3]) return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + mo + '-' + d;\n  let iso = vy + '-' + mo + '-' + d;\n  if (iso > venc) iso = (vy - 1) + '-' + mo + '-' + d;\n  return iso;\n};\nconst r2 = v => Math.round(Number(v) * 100) / 100;\nconst cents = v => Math.round(Number(v) * 100);\nconst totalFatura = r2(f.total_fatura);\n// Parcelamento da fatura (regra da Redacted): o débito total fica no Omie e ela lança o pagamento → o robô não lança essas linhas.\n// \"Parcelamento Liquidação\" é informativo e não entra no total da fatura.\nconst especialDe = d => /parcelamento\\s+liquida/i.test(d) ? 'PARC_LIQ' : /ades[aã]o\\s+(ao\\s+)?parcelamento/i.test(d) ? 'PARC_ADESAO' : /iof.*(complementar.*parcel|parcela-?do)/i.test(d) ? 'PARC_IOF' : '';\n// Tarifas do banco (anuidade, IOF, juros) às vezes vêm sem data no PDF (ex.: Caixa) → usa o vencimento da fatura\nconst ehTarifaSemData = l => ['anuidade', 'tarifa', 'iof', 'juros'].includes(String(l.tipo || '').toLowerCase()) || /ANUIDADE|TARIFA|\\bIOF\\b|JUROS|ENCARGO/i.test(String(l.descricao || ''));\nconst linhas = (f.lancamentos || []).filter(l => cents(l.valor_brl ?? l.valor) !== 0).map((l, i) => {\n  const p = String(l.parcela || '').match(/(\\d{1,2})\\s*\\/\\s*(\\d{1,2})/);\n  const moeda = String(l.moeda_original || 'BRL').toUpperCase();\n  const descricao = String(l.descricao || '').trim();\n  const dataLida = toISO(l.data);\n  return { n: i + 1, data: dataLida || (ehTarifaSemData(l) ? venc : ''), dataDoVencimento: !dataLida && ehTarifaSemData(l), descricao, valor: r2(l.valor_brl ?? l.valor), moeda, cotacao: Number(l.cotacao) || 0, valorCorrigidoPelaCotacao: false,\n    parcelaAtual: p ? Number(p[1]) : null, parcelaTotal: p ? Number(p[2]) : null, final: String(l.final_cartao || '').replace(/\\D/g, '').slice(-4),\n    titular: String(l.titular || '').trim().toUpperCase(), tipo: String(l.tipo || 'compra').toLowerCase(), internacional: !!l.internacional || moeda !== 'BRL', especial: especialDe(descricao) };\n});\nconst naSoma = () => linhas.filter(l => l.especial !== 'PARC_LIQ');\nconst somaC = () => naSoma().reduce((s, l) => s + cents(l.valor), 0);\nconst intl = linhas.filter(l => l.internacional && l.cotacao > 1.5 && l.valor > 0);\nif (somaC() !== cents(totalFatura) && intl.length && intl.length <= 10) {\n  const base = somaC() - intl.reduce((s, l) => s + cents(l.valor), 0);\n  let melhor = null;\n  for (let mask = 1; mask < (1 << intl.length); mask++) {\n    const vals = intl.map((l, k) => (mask >> k) & 1 ? r2(l.valor * l.cotacao) : l.valor);\n    const dif = Math.abs(base + vals.reduce((s, v) => s + cents(v), 0) - cents(totalFatura));\n    const nConv = intl.filter((l, k) => (mask >> k) & 1).length;\n    if (dif <= 2 * nConv && (!melhor || dif < melhor.dif)) melhor = { mask, vals, dif };\n  }\n  if (melhor) intl.forEach((l, k) => { if ((melhor.mask >> k) & 1) { l.valor = melhor.vals[k]; l.valorCorrigidoPelaCotacao = true; } });\n}\nconst soma = r2(naSoma().reduce((s, l) => s + l.valor, 0));\nconst addDays = (iso, n) => { const d = new Date(iso + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };\nconst br = iso => iso.split('-').reverse().join('/');\nreturn { json: { cliente: cfg.cliente, contaCartaoId: cfg.contaCartaoId, contaCartaoNome: cfg.contaCartaoNome, arquivo: cfg.arquivo, banco: f.banco || '', vencimento: venc,\n  buscaDe: br(addDays(venc, -5)), buscaAte: br(addDays(venc, 5)), totalFatura, pagamentoAnterior: Number(f.pagamento_fatura_anterior) || 0, somaLinhas: soma, cartoes: f.cartoes || [], linhas } };"
+      }
+    },
+    {
+      "name": "Omie - contas a pagar da fatura (só leitura)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        896,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://app.omie.com.br/api/v1/financas/contapagar/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ call: 'ListarContasPagar', param: [{ pagina: $json.pagina, registros_por_pagina: 50, filtrar_conta_corrente: $('Organizar linhas da fatura').first().json.contaCartaoId, exibir_obs: 'S' }] }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2500
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpCustomAuth"
+        }
+      }
+    },
+    {
+      "name": "Omie - categorias",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://app.omie.com.br/api/v1/geral/categorias/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ call: 'ListarCategorias', param: [{ pagina: $itemIndex + 1, registros_por_pagina: 50 }] }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2500
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpCustomAuth"
+        }
+      }
+    },
+    {
+      "name": "Comparar fatura x Omie",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const F = $('Organizar linhas da fatura').first().json;\nconst paginas = $('Omie - contas a pagar da fatura (só leitura)').all().map(i => i.json);\nconst cats = {}, catList = [];\n$('Omie - categorias').all().forEach(i => (i.json.categoria_cadastro || []).forEach(c => {\n  cats[c.codigo] = c.descricao;\n  if (c.conta_despesa === 'S' && c.totalizadora !== 'S' && c.conta_inativa !== 'S') catList.push({ codigo: c.codigo, descricao: c.descricao });\n}));\nconst forn = {};\n$('Omie - fornecedores').all().forEach(i => (i.json.clientes_cadastro_resumido || []).forEach(c => {\n  forn[c.codigo_cliente] = { cod: c.codigo_cliente, nome: c.nome_fantasia || c.razao_social || '', razao: c.razao_social || '', fantasia: c.nome_fantasia || '', cnpj: String(c.cnpj_cpf || '').replace(/\\D/g, '') };\n}));\nconst toISO = d => { const m = String(d || '').match(/(\\d{2})\\/(\\d{2})\\/(\\d{4})/); return m ? m[3] + '-' + m[2] + '-' + m[1] : ''; };\nconst addDays = (iso, n) => { const d = new Date(iso + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };\nconst cents = v => Math.round(Number(v) * 100);\nconst totalPags = Math.max(1, ...paginas.map(p => Number(p.total_de_paginas) || 0));\nconst lidas = paginas.filter(p => p.conta_pagar_cadastro).length;\nconst aviso = lidas < totalPags ? 'Algumas páginas do Omie não foram lidas (o Omie pediu para aguardar). Rode de novo para garantir.' : '';\nconst todos = paginas.flatMap(p => p.conta_pagar_cadastro || []);\nconst de = addDays(F.vencimento, -5), ate = addDays(F.vencimento, 5);\nconst todosOm = todos.map(c => ({ id: c.codigo_lancamento_omie, valor: Math.round(Number(c.valor_documento) * 100) / 100, venc: toISO(c.data_vencimento), emissao: toISO(c.data_emissao),\n  catCod: c.codigo_categoria, categoria: (cats[c.codigo_categoria] || 'código') + ' (' + c.codigo_categoria + ')', obs: c.observacao || '', parcela: c.numero_parcela || '', fornecedor: c.codigo_cliente_fornecedor,\n  fornNome: (forn[c.codigo_cliente_fornecedor] || {}).nome || String(c.codigo_cliente_fornecedor), status: c.status_titulo, usado: false }));\nconst om = todosOm.filter(c => c.venc >= de && c.venc <= ate);\n// Fornecedores já usados no cartão ANTES desta fatura\nconst usadosCartao = {};\ntodosOm.filter(c => c.venc < de).forEach(c => { usadosCartao[c.fornecedor] = (usadosCartao[c.fornecedor] || 0) + 1; });\n\nconst linhas = F.linhas.map(l => ({ ...l, status: '', om: null }));\n// Parcelamento da fatura: a Redacted controla pelo pagamento (o débito total fica no Omie) → robô não lança\nlinhas.forEach(l => { if (l.especial === 'PARC_LIQ') l.status = 'PARC_INFO'; else if (l.especial) l.status = 'PARC_FATURA'; });\nconst livres = () => linhas.filter(l => !l.status && !l.om);\n// 1) mesmo valor\nlivres().filter(l => l.valor > 0).sort((a, b) => b.valor - a.valor).forEach(l => {\n  let best = null, sc = -1;\n  for (const c of om) { if (c.usado || cents(c.valor) !== cents(l.valor)) continue; const s = c.emissao === l.data ? 2 : 0; if (s > sc) { best = c; sc = s; } }\n  if (best) { best.usado = true; l.om = best; l.status = 'OK'; }\n});\n// 2) diferença de centavos (arredondamento de parcela): até R$ 1,00\nlivres().filter(l => l.valor > 0).forEach(l => {\n  let best = null, dif = 101;\n  for (const c of om) { if (c.usado) continue; const d = Math.abs(cents(c.valor) - cents(l.valor)); if (d <= 100 && d < dif) { best = c; dif = d; } }\n  if (best) { best.usado = true; l.om = best; l.status = 'CENTAVOS'; }\n});\nlivres().filter(l => l.valor < 0).forEach(e => { const par = livres().find(x => x.valor > 0 && cents(x.valor) === -cents(e.valor)); if (par) { e.status = 'ANULA'; par.status = 'ANULA'; } });\nlivres().forEach(l => { l.status = l.valor < 0 ? 'ESTORNO' : (l.parcelaAtual > 1 ? 'FALTA_PARCELA_ANTIGA' : 'FALTA'); });\n\n// ===== Fornecedor que o robô usaria =====\nconst norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().replace(/[^A-Z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();\n// prefixos de maquininha/intermediador (não são o nome da loja)\nconst PREFIXOS = new Set(['JIM', 'MP', 'ZP', 'IG', 'PG', 'PAG', 'EC', 'SUMUP', 'TON', 'STONE', 'PAGSEGURO', 'PICPAY', 'WWW', 'DL', 'EBN', 'PP']);\nconst STOP = new Set(['LTDA', 'EPP', 'EIRELI', 'DOS', 'DAS', 'COM', 'BRASIL', 'COMERCIO', 'SERVICOS', 'LOJA', 'EMPRESA', 'SINGAPORE', 'PAGAMENTOS', 'PAGAMENTO', 'IMPORTACAO', 'EXPORTACAO', 'COMERCIAL', 'INDUSTRIA', 'BRA', 'COMPRA', 'INTERNACIONAL']);\nconst ALIAS = [[/\\bFACEBK\\b/g, 'FACEBOOK'], [/\\bMERCADO ?LIVRE\\b/g, 'MERCADOLIVRE'], [/\\bREDACTED\\w*/g, 'REDACTED'], [/\\bREDACTED\\b/g, 'REDACTED']];\nconst limpa = s => { let t = norm(s).replace(/\\b\\d{1,2} ?\\/ ?\\d{1,2}\\b/g, ' '); ALIAS.forEach(([re, v]) => { t = t.replace(re, v); }); return t; };\nconst toks = s => limpa(s).split(' ').filter(t => t.length >= 3 && !STOP.has(t) && !PREFIXOS.has(t) && !/\\d/.test(t));\nconst fornIdx = Object.values(forn).map(f => { const txt = limpa(f.razao + ' ' + f.fantasia); return { ...f, toks: new Set(toks(txt)), compact: txt.replace(/ /g, '') }; });\nconst BANCO = /SICREDI/i.test(F.contaCartaoNome) ? 'SICREDI' : /CAIXA/i.test(F.contaCartaoNome) ? 'CAIXA' : '';\nconst ehTarifa = l => ['iof', 'anuidade', 'tarifa', 'juros'].includes(l.tipo) || /\\bIOF\\b|ANUIDADE|TARIFA|JUROS|ENCARGO/.test(norm(l.descricao));\nconst maisUsado = lista => lista.sort((a, b) => (usadosCartao[b.cod] || 0) - (usadosCartao[a.cod] || 0))[0];\nfunction acharFornecedor(l) {\n  if (ehTarifa(l)) {\n    const f = BANCO && maisUsado(fornIdx.filter(x => x.compact.includes(BANCO)));\n    return f ? { f, como: 'banco do cartão' } : null;\n  }\n  // CNPJ impresso na fatura (ex.: \"Jim Com 63843661 Pe\")\n  const num = (norm(l.descricao).match(/\\b\\d{8}\\b/) || [])[0];\n  if (num) { const f = fornIdx.find(x => x.cnpj.startsWith(num)); if (f) return { f, como: 'CNPJ da fatura' }; }\n  const tk = toks(l.descricao);\n  if (!tk.length) return null;\n  const peso = tk.reduce((s, t) => s + t.length, 0);\n  let best = null;\n  for (const f of fornIdx) {\n    let sc = 0, primeiro = false;\n    tk.forEach((t, k) => { const ok = f.toks.has(t) || (t.length >= 5 && f.compact.includes(t)); if (ok) { sc += t.length; if (k === 0) primeiro = true; } });\n    if (!sc || !primeiro) continue; // o 1º nome da loja tem que bater (evita \"Papelaria X\" para \"Cores da Terra Papelaria\")\n    sc = sc / peso + (usadosCartao[f.cod] ? 0.15 : 0);\n    if (!best || sc > best.sc) best = { f, sc };\n  }\n  return best && best.sc >= 0.5 ? { f: best.f, como: 'nome' } : null;\n}\nconst nomeNovo = d => limpa(d).split(' ').filter(t => t && !PREFIXOS.has(t) && !/^\\d+$/.test(t)).join(' ');\nlinhas.forEach(l => {\n  if (!(l.om || l.status === 'FALTA' || l.status === 'FALTA_PARCELA_ANTIGA')) return;\n  const a = acharFornecedor(l);\n  l.prop = { fornCod: a ? a.f.cod : null, fornNome: a ? a.f.nome : nomeNovo(l.descricao), fornOrigem: a ? (a.como === 'nome' ? (usadosCartao[a.f.cod] ? 'cadastro (já usado no cartão)' : 'cadastro do Omie') : a.como) : 'NOVO (cadastrar)' };\n});\nconst consultar = [...new Set(linhas.filter(l => l.prop && l.prop.fornCod).map(l => l.prop.fornCod))];\nreturn [{ json: { F, aviso, de, linhas, sobras: om.filter(c => !c.usado), omie: om, lidosOmie: todos.length, cats, catList, consultar } }];"
+      }
+    },
+    {
+      "name": "Mostrar relatório",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        1568,
+        0
+      ],
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $json.html }}"
+      }
+    },
+    {
+      "name": "Páginas do Omie",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        900,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// O filtro de data do Omie não é por vencimento: busca todas as páginas do cartão e o robô filtra pelo vencimento\nreturn [1, 2, 3, 4, 5, 6, 7, 8].map(pagina => ({ json: { pagina } }));"
+      }
+    },
+    {
+      "name": "Omie - fornecedores",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1232,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://app.omie.com.br/api/v1/geral/clientes/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ call: 'ListarClientesResumido', param: [{ pagina: $itemIndex + 1, registros_por_pagina: 200, apenas_importado_api: 'N' }] }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2500
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpCustomAuth"
+        }
+      }
+    },
+    {
+      "name": "Fornecedores para consultar",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1456,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Um item por fornecedor para ler o histórico dele no Omie (todas as contas)\nconst cods = $input.first().json.consultar || [];\nreturn (cods.length ? cods : [0]).map(cod => ({ json: { cod } }));"
+      }
+    },
+    {
+      "name": "Omie - histórico dos fornecedores (só leitura)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://app.omie.com.br/api/v1/financas/contapagar/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ call: 'ListarContasPagar', param: [{ pagina: 1, registros_por_pagina: 50, filtrar_cliente: $json.cod }] }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2500
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpCustomAuth"
+        }
+      }
+    },
+    {
+      "name": "Montar relatório",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1904,
+        200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const C = $('Comparar fatura x Omie').first().json;\nconst { F, aviso, de, linhas, sobras, omie: om, cats, catList } = C;\nconst toISO = d => { const m = String(d || '').match(/(\\d{2})\\/(\\d{2})\\/(\\d{4})/); return m ? m[3] + '-' + m[2] + '-' + m[1] : ''; };\nconst cents = v => Math.round(Number(v) * 100);\nconst brl = v => Number(v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });\nconst br = iso => iso ? iso.split('-').reverse().join('/') : '';\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().replace(/[^A-Z0-9 ]/g, ' ').replace(/\\s+/g, ' ').trim();\n// Histórico de cada fornecedor em TODAS as contas do Omie (só lançamentos com vencimento anterior a esta fatura)\nconst histForn = {};\n$('Omie - histórico dos fornecedores (só leitura)').all().forEach(i => (i.json.conta_pagar_cadastro || []).forEach(c => {\n  if (toISO(c.data_vencimento) >= de || !c.codigo_categoria) return;\n  const h = histForn[c.codigo_cliente_fornecedor] = histForn[c.codigo_cliente_fornecedor] || {};\n  h[c.codigo_categoria] = (h[c.codigo_categoria] || 0) + 1;\n}));\nconst REGRAS = [\n  [/\\bIOF\\b|ANUIDADE|TARIFA|JUROS|ENCARGO/, /TARIFA|BANCAR|IOF/],\n  [/FACEBOOK|FACEBK|INSTAGRAM|GOOGLE ADS|\\bMETA\\b/, /MARKETING|PUBLICIDADE|PROPAGANDA|ANUNCI/],\n  [/ANTHROPIC|YCLOUD|FORSIGN|EEMOVEL|GOOGLE|MICROSOFT|ADOBE|CANVA|OPENAI|ZOOM/, /SISTEMAS E APLICATIVOS/],\n  [/PAPELAR|KALUNGA/, /MATERIAL DE ESCRITORIO/],\n  [/BOLO|QUEIJO|EMPORIO|SUPERM|MERCADO|BRIGADEIR|PADARIA|PANIF|CAFE|CONV|BARATO|LANCH|RESTAUR|DOCE/, /COPA|COZINHA|ALIMENTA|LANCHE/]\n];\nconst catPor = re => catList.find(c => re.test(norm(c.descricao)));\nconst catOutras = catList.find(c => norm(c.descricao).replace(/^[\\d ]+/, '') === 'OUTRAS DESPESAS') || catPor(/OUTRAS DESPESAS/);\nfunction categoria(l) {\n  // Tarifas do cartão (IOF, anuidade, juros) vão pela regra: o histórico do banco é de empréstimos\n  const tarifa = ['iof', 'anuidade', 'tarifa', 'juros'].includes(l.tipo) || /\\bIOF\\b|ANUIDADE|TARIFA|JUROS|ENCARGO/.test(norm(l.descricao));\n  const h = !tarifa && l.prop.fornCod && histForn[l.prop.fornCod];\n  if (h && Object.keys(h).length) { const cod = Object.entries(h).sort((a, b) => b[1] - a[1])[0][0]; return { catCod: cod, catNome: cats[cod] || cod, catOrigem: 'histórico do fornecedor' }; }\n  const d = norm(l.descricao) + (l.tipo === 'iof' ? ' IOF' : '') + (l.tipo === 'anuidade' ? ' ANUIDADE' : '');\n  const r = REGRAS.find(([re]) => re.test(d));\n  const c = r && catPor(r[1]);\n  if (c) return { catCod: c.codigo, catNome: c.descricao, catOrigem: 'regra por palavra' };\n  return { catCod: catOutras ? catOutras.codigo : '', catNome: catOutras ? catOutras.descricao : '(sem categoria)', catOrigem: 'dúvida → Outras Despesas' };\n}\nconst hash = s => { let h = 5381; for (const ch of s) h = ((h * 33) ^ ch.charCodeAt(0)) >>> 0; return h.toString(36).toUpperCase(); };\nconst pad3 = n => String(n).padStart(3, '0');\nconst aLancar = linhas.filter(l => l.status === 'FALTA' || l.status === 'FALTA_PARCELA_ANTIGA').map(l => {\n  const p = { ...l.prop, ...categoria(l) };\n  const parcela = l.parcelaAtual ? pad3(l.parcelaAtual) + '/' + pad3(l.parcelaTotal) : '001/001';\n  return { n: l.n, descricao: l.descricao, valor: l.valor, data: l.data, ...p, parcela,\n    omie: { codigo_lancamento_integracao: 'CC' + hash(F.contaCartaoId + '|' + F.vencimento + '|' + l.data + '|' + cents(l.valor) + '|' + norm(l.descricao)), codigo_cliente_fornecedor: p.fornCod, data_emissao: br(l.data), data_vencimento: br(F.vencimento),\n      valor_documento: l.valor, codigo_categoria: p.catCod, id_conta_corrente: F.contaCartaoId, numero_parcela: parcela,\n      observacao: 'Lançado automaticamente pelo robô da fatura do cartão (venc. ' + br(F.vencimento) + ') - ' + l.descricao } };\n});\n// Teste de acerto: nas linhas que a Redacted JÁ lançou, o robô teria escolhido o mesmo fornecedor/categoria?\nconst teste = linhas.filter(l => l.om).map(l => { const p = { ...l.prop, ...categoria(l) }; return { n: l.n, descricao: l.descricao, propForn: p.fornNome, propCat: p.catNome, realForn: l.om.fornNome, realCat: cats[l.om.catCod] || l.om.catCod,\n  okForn: String(p.fornCod) === String(l.om.fornecedor), okCat: String(p.catCod) === String(l.om.catCod) }; });\n\nconst somaOm = Math.round(om.reduce((s, c) => s + c.valor, 0) * 100) / 100;\nconst cont = s => linhas.filter(l => l.status === s).length;\nconst r = { cliente: F.cliente, vencimento: F.vencimento, totalFatura: F.totalFatura, somaLinhas: F.somaLinhas, somaOmie: somaOm, linhasFatura: linhas.length, lancOmie: om.length, lidosOmie: C.lidosOmie,\n  ok: cont('OK'), centavos: cont('CENTAVOS'), falta: cont('FALTA') + cont('FALTA_PARCELA_ANTIGA'), estorno: cont('ESTORNO'), parcFatura: cont('PARC_FATURA') + cont('PARC_INFO'), soNoOmie: sobras.length, aviso,\n  aLancar: aLancar.length, valorALancar: Math.round(aLancar.reduce((s, a) => s + a.valor, 0) * 100) / 100, fornNovos: aLancar.filter(a => !a.fornCod).length,\n  testeTotal: teste.length, testeForn: teste.filter(t => t.okForn).length, testeCat: teste.filter(t => t.okCat).length };\nr.leituraIA_ok = cents(r.somaLinhas) === cents(r.totalFatura);\nr.fechou = r.falta === 0 && r.estorno === 0 && r.soNoOmie === 0;\nconst ROT = { OK: ['Confere', '#1b7f3b'], CENTAVOS: ['Confere (diferença de centavos)', '#b26a00'], FALTA: ['Falta no Omie', '#c0392b'], FALTA_PARCELA_ANTIGA: ['Parcela faltando no Omie', '#c0392b'], ANULA: ['Cobrança e estorno se anulam', '#666'], ESTORNO: ['Estorno / crédito (ver manual)', '#b26a00'],\n  PARC_INFO: ['Parcelamento da fatura (informativo, fora da soma)', '#666'], PARC_FATURA: ['Parcelamento da fatura (Redacted controla pelo pagamento)', '#666'] };\nconst td = 'style=\"padding:4px 6px;border-bottom:1px solid #ddd;font-size:12px;vertical-align:top\"';\nconst tdr = 'style=\"padding:4px 6px;border-bottom:1px solid #ddd;font-size:12px;text-align:right;white-space:nowrap\"';\nconst th = 'style=\"padding:4px 6px;border-bottom:2px solid #333;font-size:12px;text-align:left\"';\nconst card = (t, v, cor) => '<div style=\"display:inline-block;margin:4px;padding:8px 12px;border:1px solid #ccc;border-radius:6px;min-width:120px\"><div style=\"font-size:11px;color:#555\">' + t + '</div><div style=\"font-size:18px;font-weight:bold;color:' + (cor || '#222') + '\">' + v + '</div></div>';\nlet h = '<div style=\"font-family:Arial,sans-serif;text-align:left;max-width:1100px;margin:auto\">';\nh += '<h2 style=\"margin:4px 0\">' + esc(F.cliente) + ' (' + esc(F.contaCartaoNome) + ') — fatura venc. ' + br(F.vencimento) + '</h2>';\nif (aviso) h += '<p style=\"color:#c0392b\">' + esc(aviso) + '</p>';\nh += '<p style=\"margin:2px 0;font-size:13px\">' + (r.fechou ? '<b style=\"color:#1b7f3b\">✅ Fatura FECHADA: tudo o que está na fatura está no Omie.</b>' : '<b style=\"color:#c0392b\">⚠️ Há diferenças — veja abaixo.</b>') + '</p>';\nh += '<div>' + card('Total da fatura', brl(r.totalFatura)) + card('Soma lida pela IA', brl(r.somaLinhas), r.leituraIA_ok ? '#1b7f3b' : '#c0392b') + card('Soma no Omie (venc. ' + br(F.vencimento) + ')', brl(r.somaOmie), cents(r.somaOmie) === cents(r.totalFatura) ? '#1b7f3b' : '#b26a00') + '</div>';\nh += '<div>' + card('Linhas na fatura', r.linhasFatura) + card('Conferem', r.ok + r.centavos, '#1b7f3b') + card('Faltam no Omie', r.falta, r.falta ? '#c0392b' : '#1b7f3b') + card('Parcelamento da fatura', r.parcFatura, '#666') + card('Só no Omie', r.soNoOmie, r.soNoOmie ? '#c0392b' : '#1b7f3b') + card('Lançamentos do cartão lidos no Omie', r.lidosOmie) + '</div>';\nif (!r.leituraIA_ok) h += '<p style=\"color:#c0392b;font-size:12px\">A soma das linhas lidas pela IA não bate com o total da fatura (diferença ' + brl(r.somaLinhas - r.totalFatura) + '). Confira se alguma linha foi lida errado.</p>';\nh += '<h3>Linhas da fatura</h3><table style=\"border-collapse:collapse;width:100%\"><tr><th ' + th + '>#</th><th ' + th + '>Data</th><th ' + th + '>Fatura</th><th ' + th + '>Valor</th><th ' + th + '>Situação</th><th ' + th + '>No Omie (valor / fornecedor / parcela / categoria)</th></tr>';\nlinhas.forEach(l => { h += '<tr><td ' + td + '>' + l.n + '</td><td ' + td + '>' + br(l.data) + '</td><td ' + td + '>' + esc(l.descricao) + ' <span style=\"color:#888\">(final ' + esc(l.final) + ')</span></td><td ' + tdr + '>' + brl(l.valor) + '</td><td ' + td + '><b style=\"color:' + ROT[l.status][1] + '\">' + ROT[l.status][0] + '</b></td><td ' + td + '>' + (l.om ? brl(l.om.valor) + ' — ' + esc(l.om.fornNome) + ' — parc. ' + esc(l.om.parcela) + ' — ' + esc(l.om.categoria) : '—') + '</td></tr>'; });\nh += '</table>';\nif (sobras.length) {\n  h += '<h3>Lançados no Omie com esse vencimento, mas não estão na fatura</h3><table style=\"border-collapse:collapse;width:100%\"><tr><th ' + th + '>Vencimento</th><th ' + th + '>Emissão</th><th ' + th + '>Valor</th><th ' + th + '>Fornecedor</th><th ' + th + '>Parcela</th><th ' + th + '>Categoria</th></tr>';\n  sobras.forEach(c => { h += '<tr><td ' + td + '>' + br(c.venc) + '</td><td ' + td + '>' + br(c.emissao) + '</td><td ' + tdr + '>' + brl(c.valor) + '</td><td ' + td + '>' + esc(c.fornNome) + '</td><td ' + td + '>' + esc(c.parcela) + '</td><td ' + td + '>' + esc(c.categoria) + '</td></tr>'; });\n  h += '</table>';\n}\nif (aLancar.length) {\n  h += '<h3>Simulação: o que o robô lançaria no Omie (' + aLancar.length + ' lançamentos, ' + brl(r.valorALancar) + ')</h3><p style=\"font-size:12px;color:#555\">Só a parcela desta fatura (as próximas o robô lança quando chegar a próxima fatura, sem duplicar as recorrentes). Vencimento ' + br(F.vencimento) + ', conta ' + esc(F.contaCartaoNome) + '. Fornecedores novos: ' + r.fornNovos + '.</p>';\n  h += '<table style=\"border-collapse:collapse;width:100%\"><tr><th ' + th + '>#</th><th ' + th + '>Fatura</th><th ' + th + '>Valor</th><th ' + th + '>Fornecedor</th><th ' + th + '>Categoria</th><th ' + th + '>Parcela</th></tr>';\n  aLancar.forEach(a => { h += '<tr><td ' + td + '>' + a.n + '</td><td ' + td + '>' + esc(a.descricao) + '</td><td ' + tdr + '>' + brl(a.valor) + '</td><td ' + td + '>' + esc(a.fornNome) + ' <span style=\"color:' + (a.fornCod ? '#888' : '#b26a00') + '\">(' + esc(a.fornOrigem) + ')</span></td><td ' + td + '>' + esc(a.catNome) + ' <span style=\"color:' + (a.catOrigem.startsWith('dúvida') ? '#b26a00' : '#888') + '\">(' + esc(a.catOrigem) + ')</span></td><td ' + td + '>' + a.parcela + '</td></tr>'; });\n  h += '</table>';\n}\nif (teste.length) {\n  h += '<h3>Teste de acerto: nas ' + r.testeTotal + ' linhas que a Redacted já lançou, o robô teria escolhido igual?</h3><p style=\"font-size:13px\">Fornecedor: <b>' + r.testeForn + '/' + r.testeTotal + '</b> — Categoria: <b>' + r.testeCat + '/' + r.testeTotal + '</b></p>';\n  h += '<table style=\"border-collapse:collapse;width:100%\"><tr><th ' + th + '>#</th><th ' + th + '>Fatura</th><th ' + th + '>Robô: fornecedor / categoria</th><th ' + th + '>Redacted: fornecedor / categoria</th></tr>';\n  teste.forEach(t => { h += '<tr><td ' + td + '>' + t.n + '</td><td ' + td + '>' + esc(t.descricao) + '</td><td ' + td + '><span style=\"color:' + (t.okForn ? '#1b7f3b' : '#c0392b') + '\">' + esc(t.propForn) + '</span> / <span style=\"color:' + (t.okCat ? '#1b7f3b' : '#c0392b') + '\">' + esc(t.propCat) + '</span></td><td ' + td + '>' + esc(t.realForn) + ' / ' + esc(t.realCat) + '</td></tr>'; });\n  h += '</table>';\n}\nh += '<p style=\"font-size:11px;color:#888\">Modo conferência + simulação: o robô só leu dados. Nada foi alterado no Omie.</p></div>';\nreturn [{ json: { resumo: r, linhas, sobras, aLancar, teste, html: h } }];"
+      }
+    },
+    {
+      "name": "Lançar no Omie?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2128,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "lancar1",
+              "leftValue": "={{ String($('Enviar fatura do cartão').first().json.acao || '').startsWith('Conferir e LAN') && $json.resumo.leituraIA_ok === true && !$json.resumo.aviso && ($json.aLancar || []).length > 0 && ($json.aLancar || []).every(a => /^\\d{4}-\\d{2}-\\d{2}$/.test(a.data || '')) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "name": "Relatório (sem lançamento)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2352,
+        400
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const j = $input.first().json;\nconst acao = String($('Enviar fatura do cartão').first().json.acao || '');\nlet nota = '';\nif (acao.startsWith('Conferir e LAN')) {\n  const r = j.resumo;\n  const semData = (j.aLancar || []).filter(a => !/^\\d{4}-\\d{2}-\\d{2}$/.test(a.data || '')).length;\n  const motivo = !r.leituraIA_ok ? 'a soma lida pela IA não bate com o total da fatura (por segurança o robô não lança).' : r.aviso ? 'o Omie não respondeu todas as páginas — rode de novo.' : semData ? 'a IA não leu a data de ' + semData + ' compra(s) — rode de novo.' : 'não há nada faltando no Omie.';\n  nota = '<p style=\"font-family:Arial,sans-serif;max-width:1100px;margin:8px auto;padding:8px;border:2px solid #b26a00;border-radius:6px\"><b>Nada foi lançado:</b> ' + motivo + '</p>';\n}\nreturn [{ json: { html: nota + j.html } }];"
+      }
+    },
+    {
+      "name": "Fornecedores novos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2352,
+        100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Fornecedores que não existem no Omie: o robô cadastra com o nome da fatura\nconst aL = $('Montar relatório').first().json.aLancar || [];\nconst hash = s => { let h = 5381; for (const ch of s) h = ((h * 33) ^ ch.charCodeAt(0)) >>> 0; return h.toString(36).toUpperCase(); };\nconst nomes = [...new Set(aL.filter(a => !a.fornCod).map(a => a.fornNome))];\nif (!nomes.length) return [{ json: { nenhum: true } }];\nreturn nomes.map(nome => ({ json: { nome, integ: 'ROBOF' + hash(nome) } }));"
+      }
+    },
+    {
+      "name": "Precisa cadastrar fornecedor?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2576,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "forn1",
+              "leftValue": "={{ !$json.nenhum }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "name": "Omie - cadastrar fornecedor",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2800,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://app.omie.com.br/api/v1/geral/clientes/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ call: 'IncluirCliente', param: [{ codigo_cliente_integracao: $json.integ, razao_social: $json.nome.slice(0, 60), nome_fantasia: $json.nome.slice(0, 100), tags: [{ tag: 'Fornecedor' }] }] }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2500
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpCustomAuth"
+        }
+      }
+    },
+    {
+      "name": "Preparar lançamentos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3024,
+        100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const M = $('Montar relatório').first().json;\nconst novos = {};\nlet cad = [], ents = [];\ntry { cad = $('Omie - cadastrar fornecedor').all(); ents = $('Fornecedores novos').all(); } catch (e) {}\ncad.forEach((it, i) => {\n  const nome = ents[i] && ents[i].json.nome; const j = it.json || {};\n  let cod = j.codigo_cliente_omie;\n  // se já existia (rodou antes), o Omie devolve o id na mensagem\n  if (!cod) { const m = String(j.faultstring || '').match(/(\\d{8,})/); if (m) cod = Number(m[1]); }\n  if (nome) novos[nome] = { cod, erro: cod ? '' : (j.faultstring || 'erro ao cadastrar fornecedor') };\n});\nreturn M.aLancar.map(a => {\n  const n = novos[a.fornNome] || {};\n  const cod = a.fornCod || n.cod || null;\n  return { json: { ...a, fornCodFinal: cod, fornCriado: !a.fornCod && !!cod, erroForn: cod ? '' : (n.erro || 'fornecedor não encontrado') } };\n});"
+      }
+    },
+    {
+      "name": "Omie - incluir conta a pagar",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3248,
+        100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://app.omie.com.br/api/v1/financas/contapagar/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpCustomAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ call: 'IncluirContaPagar', param: [Object.assign({}, $json.omie, { codigo_cliente_fornecedor: $json.fornCodFinal, data_previsao: $json.omie.data_vencimento })] }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 2500
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpCustomAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpCustomAuth"
+        }
+      }
+    },
+    {
+      "name": "Resumo do lançamento",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3472,
+        100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const M = $('Montar relatório').first().json;\nconst prep = $('Preparar lançamentos').all().map(i => i.json);\nconst res = $('Omie - incluir conta a pagar').all().map(i => i.json);\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst brl = v => Number(v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });\nconst L = prep.map((p, i) => {\n  const r = res[i] || {};\n  const ok = !!r.codigo_lancamento_omie && String(r.codigo_status ?? '0') === '0';\n  const dup = !ok && /j[aá] (est[aá] |foi )?cadastrad|j[aá] existe/i.test(String(r.faultstring || ''));\n  return { ...p, ok, dup, id: r.codigo_lancamento_omie || '', msg: ok ? 'Lançado' : dup ? 'Já existia (não duplicou)' : (p.erroForn || r.faultstring || r.descricao_status || 'erro') };\n});\nconst nOk = L.filter(l => l.ok).length, nDup = L.filter(l => l.dup).length, nErr = L.length - nOk - nDup;\nconst vOk = L.filter(l => l.ok).reduce((s, l) => s + l.valor, 0);\nconst td = 'style=\"padding:4px 6px;border-bottom:1px solid #ddd;font-size:12px;vertical-align:top\"';\nconst th = 'style=\"padding:4px 6px;border-bottom:2px solid #333;font-size:12px;text-align:left\"';\nlet h = '<div style=\"font-family:Arial,sans-serif;text-align:left;max-width:1100px;margin:8px auto;padding:10px;border:2px solid ' + (nErr ? '#c0392b' : '#1b7f3b') + ';border-radius:8px\">';\nh += '<h2 style=\"margin:4px 0\">Lançamento no Omie: ' + nOk + ' lançados (' + brl(vOk) + ')' + (nDup ? ', ' + nDup + ' já existiam' : '') + (nErr ? ', <span style=\"color:#c0392b\">' + nErr + ' com erro</span>' : '') + '</h2>';\nh += '<p style=\"font-size:12px;color:#555\">Todos com a observação \"Lançado automaticamente pelo robô da fatura do cartão\". Se algum estiver errado, corrija ou exclua manualmente no Omie.</p>';\nh += '<table style=\"border-collapse:collapse;width:100%\"><tr><th ' + th + '>#</th><th ' + th + '>Fatura</th><th ' + th + '>Valor</th><th ' + th + '>Fornecedor</th><th ' + th + '>Categoria</th><th ' + th + '>Resultado</th></tr>';\nL.forEach(l => { h += '<tr><td ' + td + '>' + l.n + '</td><td ' + td + '>' + esc(l.descricao) + '</td><td ' + td + '>' + brl(l.valor) + '</td><td ' + td + '>' + esc(l.fornNome) + (l.fornCriado ? ' <span style=\"color:#b26a00\">(cadastrado agora)</span>' : '') + '</td><td ' + td + '>' + esc(l.catNome) + '</td><td ' + td + '><b style=\"color:' + (l.ok ? '#1b7f3b' : l.dup ? '#666' : '#c0392b') + '\">' + esc(l.msg) + '</b></td></tr>'; });\nh += '</table></div>';\nconst corpo = String(M.html).replace('Modo conferência + simulação: o robô só leu dados. Nada foi alterado no Omie.', 'A conferência acima foi feita ANTES do lançamento.');\nreturn [{ json: { lancados: nOk, jaExistiam: nDup, erros: nErr, valorLancado: Math.round(vOk * 100) / 100, resultado: L.map(l => ({ n: l.n, descricao: l.descricao, valor: l.valor, msg: l.msg, id: l.id })), html: h + corpo } }];"
+      }
+    },
+    {
+      "name": "Mostrar resultado do lançamento",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        3696,
+        100
+      ],
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $json.html }}"
+      }
+    }
+  ],
+  "connections": {
+    "Enviar fatura do cartão": {
+      "main": [
+        [
+          {
+            "node": "Config do cliente + PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config do cliente + PDF": {
+      "main": [
+        [
+          {
+            "node": "IA - Gemini lê a fatura",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IA - Gemini lê a fatura": {
+      "main": [
+        [
+          {
+            "node": "Organizar linhas da fatura",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Omie - contas a pagar da fatura (só leitura)": {
+      "main": [
+        [
+          {
+            "node": "Omie - categorias",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Organizar linhas da fatura": {
+      "main": [
+        [
+          {
+            "node": "Páginas do Omie",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Páginas do Omie": {
+      "main": [
+        [
+          {
+            "node": "Omie - contas a pagar da fatura (só leitura)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Omie - categorias": {
+      "main": [
+        [
+          {
+            "node": "Omie - fornecedores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Omie - fornecedores": {
+      "main": [
+        [
+          {
+            "node": "Comparar fatura x Omie",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Comparar fatura x Omie": {
+      "main": [
+        [
+          {
+            "node": "Fornecedores para consultar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fornecedores para consultar": {
+      "main": [
+        [
+          {
+            "node": "Omie - histórico dos fornecedores (só leitura)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Omie - histórico dos fornecedores (só leitura)": {
+      "main": [
+        [
+          {
+            "node": "Montar relatório",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar relatório": {
+      "main": [
+        [
+          {
+            "node": "Lançar no Omie?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lançar no Omie?": {
+      "main": [
+        [
+          {
+            "node": "Fornecedores novos",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Relatório (sem lançamento)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Relatório (sem lançamento)": {
+      "main": [
+        [
+          {
+            "node": "Mostrar relatório",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fornecedores novos": {
+      "main": [
+        [
+          {
+            "node": "Precisa cadastrar fornecedor?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Precisa cadastrar fornecedor?": {
+      "main": [
+        [
+          {
+            "node": "Omie - cadastrar fornecedor",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Preparar lançamentos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Omie - cadastrar fornecedor": {
+      "main": [
+        [
+          {
+            "node": "Preparar lançamentos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar lançamentos": {
+      "main": [
+        [
+          {
+            "node": "Omie - incluir conta a pagar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Omie - incluir conta a pagar": {
+      "main": [
+        [
+          {
+            "node": "Resumo do lançamento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resumo do lançamento": {
+      "main": [
+        [
+          {
+            "node": "Mostrar resultado do lançamento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

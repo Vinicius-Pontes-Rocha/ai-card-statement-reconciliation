@@ -1,0 +1,906 @@
+{
+  "name": "02-reconcile-erp-a",
+  "nodes": [
+    {
+      "name": "Enviar fatura do cartão",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "formTitle": "Conferência da fatura do cartão",
+        "formDescription": "Envie o PDF da fatura. O robô lê todas as linhas e confere com o Conta Azul. Em \"Conferir e LANÇAR\", ele lança só o que ainda não está no Conta Azul (nunca apaga nem altera nada).",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Cliente",
+              "fieldName": "cliente",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Redacted Matriz"
+                  }
+                ]
+              }
+            },
+            {
+              "fieldLabel": "Fatura (PDF)",
+              "fieldName": "fatura",
+              "fieldType": "file",
+              "multipleFiles": false,
+              "acceptFileTypes": ".pdf",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "O que fazer",
+              "fieldName": "modo",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Só conferir (não grava nada)"
+                  },
+                  {
+                    "option": "Conferir e LANÇAR no Conta Azul"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "options": {
+          "buttonLabel": "Conferir fatura",
+          "path": "conferir-fatura-cartao",
+          "appendAttribution": false
+        },
+        "authentication": "basicAuth"
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpBasicAuth"
+        }
+      }
+    },
+    {
+      "name": "Config do cliente + PDF",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Cadastro dos clientes: conta do cartão no Conta Azul + regras de lançamento combinadas com a Redacted.\n// Para cada cliente novo: adicionar aqui + criar a credencial do Conta Azul dele.\nconst REGRAS_REDACTED = [                                 // texto da fatura contém -> força esses campos\n  { contem: 'UBER', descricao: 'UBER', fornecedor: 'UBER DO BRASIL TECNOLOGIA LTDA.', categoria: 'Transportes' },\n  { contem: 'ROLDAO', fornecedor: 'ROLDAO AUTO SERVICO COMERCIO DE ALIMENTO' },\n  { contem: 'AMAZON', categoria: 'Despesas a Classificar' }\n];\nconst CLIENTES = {\n  'Redacted Matriz': {\n    contaCartaoId: '<ID>',\n    contaCartaoNome: 'CARTÃO DE CRÉDITO ITAÚ',\n    centroCustoPadrao: 'Redacted Matriz',          // sempre (Redacted, 14/10/2026)\n    categoriaDuvida: 'Despesas a Classificar',        // na dúvida\n    regras: REGRAS_REDACTED\n  },\n  'Conta de TESTE (fictícia)': {                     // conta de teste do Conta Azul (dados fictícios)\n    contaCartaoId: '<ID>',\n    contaCartaoNome: 'BANCO TESTE',\n    centroCustoPadrao: '',\n    categoriaDuvida: 'Bens de Pequeno Valor',\n    regras: REGRAS_REDACTED\n  }\n};\nconst cliente = $json.cliente || $json.Cliente;\nconst cfg = CLIENTES[cliente];\nif (!cfg) throw new Error('Cliente sem cadastro no robô: ' + cliente);\n\nconst bin = $input.item.binary || {};\nconst key = Object.keys(bin)[0];\nif (!key) throw new Error('Nenhum PDF recebido no formulário.');\nconst buf = await this.helpers.getBinaryDataBuffer($itemIndex, key);\n\nconst prompt = [\n  'Você é um assistente contábil. Leia a FATURA DE CARTÃO DE CRÉDITO em PDF e devolva SOMENTE um JSON válido (sem markdown).',\n  'Regras:',\n  '- Liste TODOS os lançamentos de TODOS os cartões (titular e adicionais), nacionais e internacionais, inclusive IOF, anuidade, tarifas, juros, encargos, estornos e créditos.',\n  '- NÃO inclua o pagamento da fatura anterior como lançamento; informe o valor dele em pagamento_fatura_anterior.',\n  '- NÃO inclua linhas de subtotal/total. Não invente nada; não pule linhas; não junte linhas.',\n  '- descricao: copie EXATAMENTE o texto do estabelecimento como impresso, incluindo o número da parcela se vier junto (ex.: \"LEROY MERLIN 06/06\").',\n  '- data: a data da linha exatamente como impressa, no formato DD/MM.',\n  '- valor_brl: valor em REAIS (R$), número com ponto decimal. Compras/débitos positivos; estornos/créditos NEGATIVOS.',\n  '- COMPRAS INTERNACIONAIS: a fatura mostra, na mesma linha ou logo abaixo, o valor na moeda original (ex.: dólar), a cotação do dólar e o valor em R$. Preencha moeda_original (ex.: \"USD\"), valor_moeda_original (o valor em dólar), cotacao e valor_brl (o valor em R$, que é aproximadamente valor_moeda_original x cotacao). valor_brl NUNCA é o valor em dólar. Para compras nacionais deixe moeda_original \"BRL\", valor_moeda_original = valor_brl, cotacao 1.',\n  '- O IOF / repasse de IOF de compra internacional é uma linha separada, tipo iof.',\n  '- CONFERÊNCIA OBRIGATÓRIA: a soma de todos os valor_brl deve ser igual a total_fatura. Se não bater, releia as linhas (principalmente internacionais e estornos) antes de responder.',\n  '- parcela: \"NN/NN\" se a linha for parcelada (ex.: \"06/06\"), senão \"\".',\n  '- final_cartao: 4 últimos dígitos do cartão daquela linha. titular: nome impresso do portador daquele cartão.',\n  '- tipo: um de compra, estorno, iof, anuidade, tarifa, juros, outro.',\n  '- vencimento no formato AAAA-MM-DD. total_fatura = total a pagar desta fatura.',\n  'Formato:',\n  '{\"banco\":\"\",\"vencimento\":\"AAAA-MM-DD\",\"total_fatura\":0,\"pagamento_fatura_anterior\":0,\"cartoes\":[{\"final\":\"\",\"titular\":\"\"}],\"lancamentos\":[{\"data\":\"DD/MM\",\"descricao\":\"\",\"moeda_original\":\"BRL\",\"valor_moeda_original\":0,\"cotacao\":1,\"valor_brl\":0,\"parcela\":\"\",\"final_cartao\":\"\",\"titular\":\"\",\"tipo\":\"compra\",\"internacional\":false}]}'\n].join('\\n');\n\nreturn { json: {\n  cliente,\n  modo: String($json.modo || '').toUpperCase().includes('LANÇAR') ? 'lancar' : 'conferir',\n  contaCartaoId: cfg.contaCartaoId,\n  contaCartaoNome: cfg.contaCartaoNome,\n  centroCustoPadrao: cfg.centroCustoPadrao || '',\n  categoriaDuvida: cfg.categoriaDuvida || 'Despesas a Classificar',\n  regras: cfg.regras || [],\n  arquivo: bin[key].fileName || 'fatura.pdf',\n  prompt,\n  pdf_b64: buf.toString('base64')\n} };"
+      }
+    },
+    {
+      "name": "IA - Gemini lê a fatura",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        448,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [{ parts: [ { inline_data: { mime_type: 'application/pdf', data: $json.pdf_b64 } }, { text: $json.prompt } ] }], generationConfig: { responseMimeType: 'application/json', temperature: 0 } }) }}",
+        "options": {
+          "timeout": 180000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpHeaderAuth"
+        }
+      }
+    },
+    {
+      "name": "Organizar linhas da fatura",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const raw = ($json.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('');\nif (!raw.trim()) throw new Error('A IA não devolveu nada para esta fatura.');\nlet f;\ntry { f = JSON.parse(raw); }\ncatch (e) { f = JSON.parse(raw.replace(/^\\s*```(json)?/i, '').replace(/```\\s*$/, '').trim()); }\n\nconst cfg = $('Config do cliente + PDF').item.json;\nconst venc = String(f.vencimento || '').slice(0, 10);\nif (!/^\\d{4}-\\d{2}-\\d{2}$/.test(venc)) throw new Error('Não achei o vencimento da fatura: ' + f.vencimento);\nconst vy = Number(venc.slice(0, 4));\n\n// Ano da compra: a fatura só mostra DD/MM. Usa o ano do vencimento; se a data ficar depois do vencimento, é do ano anterior.\n// Aceita \"24/09\", \"24/set\", \"24 SET\", \"24/09/2026\" e \"2026-09-24\" (a IA às vezes devolve o mês por extenso)\nconst MESES = { jan: 1, fev: 2, mar: 3, abr: 4, mai: 5, jun: 6, jul: 7, ago: 8, set: 9, out: 10, nov: 11, dez: 12 };\nconst toISO = txt => {\n  const s = String(txt || '').trim().toLowerCase();\n  let m = s.match(/^(\\d{4})-(\\d{2})-(\\d{2})/);\n  if (m) return m[1] + '-' + m[2] + '-' + m[3];\n  m = s.match(/(\\d{1,2})\\s*[\\/\\-. ]\\s*([a-zç]{3,}|\\d{1,2})(?:\\s*[\\/\\-. ]\\s*(\\d{2,4}))?/);\n  if (!m) return '';\n  const mesN = /\\d/.test(m[2]) ? Number(m[2]) : MESES[m[2].slice(0, 3)];\n  if (!mesN) return '';\n  const d = m[1].padStart(2, '0'), mo = String(mesN).padStart(2, '0');\n  if (m[3]) return (m[3].length === 2 ? '20' + m[3] : m[3]) + '-' + mo + '-' + d;\n  let iso = vy + '-' + mo + '-' + d;\n  if (iso > venc) iso = (vy - 1) + '-' + mo + '-' + d;\n  return iso;\n};\n\nconst r2 = v => Math.round(Number(v) * 100) / 100;\nconst cents = v => Math.round(Number(v) * 100);\nconst totalFatura = r2(f.total_fatura);\n// Linhas de R$ 0,00 (ex.: \"Repasse de IOF\" zerado) são ignoradas\nconst linhas = (f.lancamentos || []).filter(l => cents(l.valor_brl ?? l.valor) !== 0).map((l, i) => {\n  const p = String(l.parcela || '').match(/(\\d{1,2})\\s*\\/\\s*(\\d{1,2})/);\n  const moeda = String(l.moeda_original || 'BRL').toUpperCase();\n  return {\n    n: i + 1,\n    data: toISO(l.data),\n    descricao: String(l.descricao || '').trim(),\n    valor: r2(l.valor_brl ?? l.valor),\n    moeda, cotacao: Number(l.cotacao) || 0, valorCorrigidoPelaCotacao: false,\n    parcelaAtual: p ? Number(p[1]) : null,\n    parcelaTotal: p ? Number(p[2]) : null,\n    final: String(l.final_cartao || '').replace(/\\D/g, '').slice(-4),\n    titular: String(l.titular || '').trim().toUpperCase(),\n    tipo: String(l.tipo || 'compra').toLowerCase(),\n    internacional: !!l.internacional || moeda !== 'BRL'\n  };\n});\n\n// Internacional: a IA às vezes põe o valor em dólar no campo de R$. Se a soma não fecha com o total,\n// testa converter (valor x cotação) cada linha internacional e fica com a combinação que fecha o total\n// (tolerância de 2 centavos por linha convertida, por arredondamento da cotação).\nconst somaC = () => linhas.reduce((s, l) => s + cents(l.valor), 0);\nconst intl = linhas.filter(l => l.internacional && l.cotacao > 1.5 && l.valor > 0);\nif (somaC() !== cents(totalFatura) && intl.length && intl.length <= 10) {\n  const base = somaC() - intl.reduce((s, l) => s + cents(l.valor), 0);\n  let melhor = null;\n  for (let mask = 1; mask < (1 << intl.length); mask++) {\n    const vals = intl.map((l, k) => (mask >> k) & 1 ? r2(l.valor * l.cotacao) : l.valor);\n    const dif = Math.abs(base + vals.reduce((s, v) => s + cents(v), 0) - cents(totalFatura));\n    const nConv = intl.filter((l, k) => (mask >> k) & 1).length;\n    if (dif <= 2 * nConv && (!melhor || dif < melhor.dif)) melhor = { mask, vals, dif };\n  }\n  if (melhor) intl.forEach((l, k) => { if ((melhor.mask >> k) & 1) { l.valor = melhor.vals[k]; l.valorCorrigidoPelaCotacao = true; } });\n}\n\nconst soma = r2(linhas.reduce((s, l) => s + l.valor, 0));\nconst addDays = (iso, n) => { const d = new Date(iso + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };\n\nreturn { json: {\n  cliente: cfg.cliente,\n  contaCartaoId: cfg.contaCartaoId,\n  contaCartaoNome: cfg.contaCartaoNome,\n  arquivo: cfg.arquivo,\n  banco: f.banco || '',\n  vencimento: venc,\n  buscaDe: addDays(venc, -5),\n  buscaAte: addDays(venc, 5),\n  totalFatura,\n  pagamentoAnterior: Number(f.pagamento_fatura_anterior) || 0,\n  somaLinhas: soma,\n  cartoes: f.cartoes || [],\n  linhas\n} };"
+      }
+    },
+    {
+      "name": "Conta Azul - despesas do cartão (só leitura)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        896,
+        0
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api-v2.contaazul.com/v1/financeiro/eventos-financeiros/contas-a-pagar/buscar",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "pagina",
+              "value": "1"
+            },
+            {
+              "name": "tamanho_pagina",
+              "value": "100"
+            },
+            {
+              "name": "data_vencimento_de",
+              "value": "={{ $json.buscaDe }}"
+            },
+            {
+              "name": "data_vencimento_ate",
+              "value": "={{ $json.buscaAte }}"
+            },
+            {
+              "name": "ids_contas_financeiras",
+              "value": "={{ $json.contaCartaoId }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "oAuth2Api"
+        }
+      }
+    },
+    {
+      "name": "Comparar fatura x Conta Azul",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1232,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const F = $('Organizar linhas da fatura').first().json;\nconst CFG = $('Config do cliente + PDF').first().json;\nconst resp = $('Conta Azul - despesas do cartão (só leitura)').first().json;\nconst mapCA = c => ({\n  id: c.id,\n  descricao: c.descricao || '',\n  valor: Math.round(Number(c.total) * 100) / 100,\n  competencia: String(c.data_competencia || '').slice(0, 10),\n  vencimento: String(c.data_vencimento || '').slice(0, 10),\n  categoria: (c.categorias || []).map(x => x.nome).join(', '),\n  cats: c.categorias || [],\n  centroCusto: (c.centros_de_custo || c.centros_custo || []).map(x => x.nome).join(', '),\n  ccs: c.centros_de_custo || c.centros_custo || [],\n  fornecedor: c.fornecedor?.nome || '',\n  fornecedorId: c.fornecedor?.id || '',\n  usado: false\n});\nconst ca = (resp.itens || []).map(mapCA);\n// Histórico de 12 meses do cartão, SEM a fatura atual\nconst hist = $('Conta Azul - histórico do cartão (só leitura)').all().flatMap(i => i.json.itens || []).map(mapCA).filter(c => c.vencimento && c.vencimento < F.buscaDe);\n\n// Dicionários nome -> id (categoria, fornecedor, centro de custo)\nconst catId = {}, fornId = {}, ccId = {};\nconst K = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().replace(/[^A-Z0-9]+/g, '');\n[...hist, ...ca].forEach(c => {\n  c.cats.forEach(x => { if (x.id && x.nome) catId[K(x.nome)] = x.id; });\n  c.ccs.forEach(x => { if (x.id && x.nome) ccId[K(x.nome)] = x.id; });\n  if (c.fornecedorId && c.fornecedor) fornId[K(c.fornecedor)] = c.fornecedorId;\n});\ntry { ($('Conta Azul - categorias').first().json.itens || []).forEach(x => { if (x.id && x.nome && !catId[K(x.nome)]) catId[K(x.nome)] = x.id; }); } catch (e) {}\ntry { const cc = $('Conta Azul - centros de custo').first().json; (cc.itens || cc.items || []).forEach(x => { if (x.id && x.nome && !ccId[K(x.nome)]) ccId[K(x.nome)] = x.id; }); } catch (e) {}\n\n// Nome do portador como a Redacted escreve (ex.: \"SOLANGE MORAIS TEIXEIRA\"), por final do cartão\nconst nomePorFinal = {};\n[...hist, ...ca].forEach(c => { const m = c.descricao.toUpperCase().match(/-\\s*([A-ZÀ-Ü][A-ZÀ-Ü ]+?)\\s*-\\s*FINAL\\s*(\\d{4})/); if (m) nomePorFinal[m[2]] = m[1].trim(); });\n\nconst nomes = new Set(['IDENTIFICAR', 'DESPESA', 'FINAL', 'DESPESAS', 'CLASSIFICAR', 'PENDENTE']);\n(F.cartoes || []).forEach(c => String(c.titular || '').toUpperCase().split(/\\s+/).forEach(t => nomes.add(t)));\nF.linhas.forEach(l => l.titular.split(/\\s+/).forEach(t => nomes.add(t)));\nObject.values(nomePorFinal).forEach(n => n.split(/\\s+/).forEach(t => nomes.add(t)));\nconst norm = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();\nconst compact = s => norm(s).replace(/\\s+/g, '');\nconst toks = s => norm(s).split(' ').filter(t => t.length >= 3 && !nomes.has(t) && !/^\\d+$/.test(t));\nconst comum = (a, b) => { const B = new Set(toks(b)); return toks(a).filter(t => B.has(t)).length; };\nconst cents = v => Math.round(Number(v) * 100);\nconst brl = v => Number(v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });\nconst br = iso => iso ? iso.split('-').reverse().join('/') : '';\n\nconst linhas = F.linhas.map(l => ({ ...l, status: '', ca: null, descConfere: null }));\n\n// 1) Mesmo valor (prefere mesma data de compra e nome parecido)\n[...linhas].filter(l => l.valor > 0).sort((a, b) => b.valor - a.valor).forEach(l => {\n  let best = null, bestScore = -1;\n  for (const c of ca) {\n    if (c.usado || cents(c.valor) !== cents(l.valor)) continue;\n    const s = (c.competencia === l.data ? 4 : 0) + comum(l.descricao, c.descricao + ' ' + c.fornecedor) + (c.descricao.includes(l.final) ? 1 : 0);\n    if (s > bestScore) { best = c; bestScore = s; }\n  }\n  if (best) { best.usado = true; l.ca = best; l.status = best.competencia === l.data ? 'OK' : 'OK_DATA'; }\n});\n\n// 2) Valor diferente: mesmo nome, valor próximo\nlinhas.filter(l => !l.ca && l.valor > 0).forEach(l => {\n  let best = null, bestScore = 0;\n  for (const c of ca) {\n    if (c.usado) continue;\n    const s = comum(l.descricao, c.descricao + ' ' + c.fornecedor);\n    const dif = Math.abs(c.valor - l.valor);\n    if (s >= 1 && dif <= Math.max(1, l.valor * 0.15) && s > bestScore) { best = c; bestScore = s; }\n  }\n  if (best) { best.usado = true; l.ca = best; l.status = 'VALOR_DIF'; }\n});\n\n// 2b) Uma linha da fatura lançada em várias partes no CA (ex.: repasse de IOF separado por compra)\nlinhas.filter(l => !l.ca && l.valor > 0).forEach(l => {\n  const cands = ca.filter(c => !c.usado && (comum(l.descricao, c.descricao + ' ' + c.fornecedor) >= 1 || (l.tipo === 'iof' && norm(c.descricao).includes('IOF'))));\n  if (cands.length < 2) return;\n  const soma = cands.reduce((s, c) => s + cents(c.valor), 0);\n  if (soma !== cents(l.valor)) return;\n  cands.forEach(c => { c.usado = true; });\n  l.ca = { descricao: cands.map(c => c.descricao).join(' + '), valor: soma / 100, competencia: cands[0].competencia, categoria: [...new Set(cands.map(c => c.categoria))].join(', '), fornecedor: '', centroCusto: '', dividido: true };\n  l.status = 'OK_DIVIDIDO';\n});\n\n// 3) Estorno x cobrança de mesmo valor na própria fatura que não estão no CA -> se anulam\nlinhas.filter(l => !l.ca && l.valor < 0).forEach(e => {\n  const par = linhas.find(x => !x.ca && !x.status && x.valor > 0 && cents(x.valor) === -cents(e.valor));\n  if (par) { e.status = 'ANULA'; par.status = 'ANULA'; }\n});\nlinhas.filter(l => !l.status).forEach(l => {\n  if (l.valor < 0) l.status = 'ESTORNO';\n  else if (l.parcelaAtual && l.parcelaAtual > 1) l.status = 'FALTA_PARCELA_ANTIGA';\n  else l.status = 'FALTA';\n});\n\nlinhas.forEach(l => { if (l.ca) l.descConfere = compact(l.ca.descricao).includes(compact(l.descricao)); });\nconst sobras = ca.filter(c => !c.usado);\n\n// ---------- SUGESTÃO DE LANÇAMENTO (aprende só com meses anteriores + regras da Redacted) ----------\nconst semParcela = s => String(s).replace(/\\d{1,2}\\s*\\/\\s*\\d{1,2}/g, ' ');\nconst pontua = (l, h) => {\n  const a = semParcela(l.descricao), b = semParcela(h.descricao);\n  let s = comum(a, b);\n  const ca_ = compact(a), cb = compact(b);\n  s += toks(b).filter(t => t.length >= 4 && ca_.includes(t) && !toks(a).includes(t)).length;\n  s += toks(a).filter(t => t.length >= 4 && cb.includes(t) && !toks(b).includes(t)).length;\n  return s;\n};\nconst nomeFornecedorNovo = d => String(d).replace(/\\d{1,2}\\s*\\/\\s*\\d{1,2}/g, ' ').replace(/-\\s*CT\\b.*$/i, ' ').replace(/^[A-Z]{1,4}\\s*\\*\\s*/i, '').replace(/\\*/g, ' ').replace(/\\s+/g, ' ').trim().toUpperCase() || String(d).toUpperCase();\nconst moda = (lista, k) => { const c = new Map(); lista.forEach(h => c.set(h[k], (c.get(h[k]) || 0) + 1)); let m = null; for (const [v, n] of c) if (!m || n > m[1]) m = [v, n]; return m ? m[0] : ''; };\nconst sugerir = l => {\n  const nome = nomePorFinal[l.final] || l.titular;\n  const prefixo = (l.parcelaAtual === 1 && l.parcelaTotal > 1) ? ('1/' + l.parcelaTotal + ' - ') : '';\n  const padrao = prefixo + 'IDENTIFICAR DESPESA - ' + l.descricao + ' - ' + nome + ' - FINAL ' + l.final;\n  let best = [], bestS = 0;\n  for (const h of hist) {\n    let s = pontua(l, h);\n    if (!s) continue;\n    if (l.parcelaTotal && cents(h.valor) === cents(l.valor)) s += 3;\n    if (s > bestS) { bestS = s; best = [h]; } else if (s === bestS) best.push(h);\n  }\n  let r;\n  if (!best.length) {\n    r = { fonte: 'novo (sem histórico)', descricao: padrao, categoria: CFG.categoriaDuvida, fornecedor: nomeFornecedorNovo(l.descricao) };\n  } else {\n    best.sort((a, b) => b.vencimento.localeCompare(a.vencimento));\n    const mesRecente = best[0].vencimento.slice(0, 7);\n    const doMes = best.filter(h => h.vencimento.slice(0, 7) === mesRecente);\n    const modelo = moda(doMes, 'descricao');\n    let desc;\n    if (/IDENTIFICAR\\s+DESPESA/i.test(modelo)) desc = padrao;\n    else desc = l.parcelaTotal ? modelo.replace(/(\\d{1,2})\\s*\\/\\s*(\\d{1,2})/, (m, a) => { const p = n => a.length === 2 ? String(n).padStart(2, '0') : String(n); return p(l.parcelaAtual) + '/' + p(l.parcelaTotal); }) : modelo;\n    if (prefixo && !desc.startsWith(prefixo)) desc = prefixo + desc;\n    const catsMes = [...new Set(doMes.map(h => h.categoria))];\n    const categoria = catsMes.length === 1 ? catsMes[0] : CFG.categoriaDuvida;\n    let fornecedor = moda(doMes.filter(h => h.fornecedor), 'fornecedor') || moda(best.filter(h => h.fornecedor), 'fornecedor');\n    if (!fornecedor) fornecedor = nomeFornecedorNovo(l.descricao);\n    r = { fonte: 'histórico (' + best.length + ')', descricao: desc, categoria: categoria || CFG.categoriaDuvida, fornecedor };\n  }\n  for (const rg of (CFG.regras || [])) {\n    if (!compact(l.descricao).includes(compact(rg.contem))) continue;\n    if (rg.descricao) r.descricao = prefixo + rg.descricao + ' - ' + nome + ' - FINAL ' + l.final;\n    if (rg.fornecedor) r.fornecedor = rg.fornecedor;\n    if (rg.categoria) r.categoria = rg.categoria;\n    r.fonte += ' + regra ' + rg.contem;\n  }\n  r.centroCusto = CFG.centroCustoPadrao || '';\n  if (!catId[K(r.categoria)]) r.categoria = CFG.categoriaDuvida;\n  r.categoriaId = catId[K(r.categoria)] || '';\n  r.fornecedorId = fornId[K(r.fornecedor)] || '';\n  r.centroCustoId = ccId[K(r.centroCusto)] || '';\n  if (r.centroCusto && !r.centroCustoId) r.centroCusto = '';\n  return r;\n};\nconst igual = (a, b) => compact(a) === compact(b);\nconst sim = linhas.filter(l => l.valor > 0).map(l => {\n  const r = sugerir(l);\n  const real = l.ca && !l.ca.dividido ? l.ca : null;\n  const ok = real ? {\n    descricao: igual(r.descricao, real.descricao), categoria: igual(r.categoria, real.categoria), fornecedor: igual(r.fornecedor, real.fornecedor),\n    centroCusto: igual(r.centroCusto, real.centroCusto), competencia: l.data === real.competencia\n  } : null;\n  return { n: l.n, status: l.status, fatura: l.descricao, valor: l.valor, data: l.data, final: l.final, robo: { ...r, competencia: l.data || F.vencimento, vencimento: F.vencimento }, Redacted: real ? { descricao: real.descricao, categoria: real.categoria, fornecedor: real.fornecedor, centroCusto: real.centroCusto, competencia: real.competencia } : null, ok };\n});\nconst comp = sim.filter(s => s.ok);\nconst pct = f => comp.length ? Math.round(100 * comp.filter(f).length / comp.length) : 0;\nconst simResumo = {\n  linhas: sim.length, comparadas: comp.length, historico: hist.length,\n  mesesHistorico: [...new Set(hist.map(h => h.vencimento.slice(0, 7)))].sort(),\n  descricao: pct(s => s.ok.descricao), categoria: pct(s => s.ok.categoria), fornecedor: pct(s => s.ok.fornecedor),\n  centroCusto: pct(s => s.ok.centroCusto), competencia: pct(s => s.ok.competencia),\n  lancamentoCerto: pct(s => s.ok.categoria && s.ok.fornecedor && s.ok.competencia),\n  semHistorico: sim.filter(s => s.robo.fonte.startsWith('novo')).length\n};\n\n// ---------- O QUE O ROBÔ VAI LANÇAR (só linhas que NÃO estão no CA) ----------\nconst aLancar = sim.filter(s => ['FALTA', 'FALTA_PARCELA_ANTIGA'].includes(s.status)).map(s => ({\n  n: s.n, fatura: s.fatura, valor: s.valor,\n  descricao: s.robo.descricao, categoria: s.robo.categoria, categoriaId: s.robo.categoriaId,\n  fornecedor: s.robo.fornecedor, fornecedorId: s.robo.fornecedorId,\n  centroCusto: s.robo.centroCusto, centroCustoId: s.robo.centroCustoId,\n  competencia: s.robo.competencia, vencimento: F.vencimento, contaCartaoId: F.contaCartaoId,\n  referencia: 'robo-cartao:' + s.final + ':' + F.vencimento + ':' + s.n + ':' + cents(s.valor)\n}));\nconst bloqueios = [];\nif (!(cents(F.somaLinhas) === cents(F.totalFatura))) bloqueios.push('A leitura da IA não fechou com o total da fatura.');\nif (aLancar.some(a => !a.categoriaId)) bloqueios.push('Não achei o ID da categoria \"' + CFG.categoriaDuvida + '\" no Conta Azul.');\nif (aLancar.length > 150) bloqueios.push('Mais de 150 lançamentos de uma vez (limite de segurança).');\nconst podeLancar = CFG.modo === 'lancar' && aLancar.length > 0 && bloqueios.length === 0;\n\n// Alertas de qualidade nos lançamentos do CA\nconst alertas = [];\nconst aClass = ca.filter(c => norm(c.categoria).includes('CLASSIFICAR') || !c.categoria);\nif (aClass.length) alertas.push({ tipo: 'Categoria pendente', texto: aClass.length + ' lançamento(s) em \"Despesas a Classificar\" (' + brl(aClass.reduce((s, c) => s + c.valor, 0)) + ').', itens: aClass.map(c => c.descricao + ' — ' + brl(c.valor)) });\nconst semForn = ca.filter(c => !c.fornecedor);\nif (semForn.length) alertas.push({ tipo: 'Fornecedor vazio', texto: semForn.length + ' lançamento(s) sem fornecedor.', itens: semForn.map(c => c.descricao + ' — ' + brl(c.valor)) });\nconst futuras = ca.filter(c => c.competencia && c.competencia > F.vencimento);\nif (futuras.length) alertas.push({ tipo: 'Competência futura', texto: 'Competência depois do vencimento da fatura (provável erro de digitação).', itens: futuras.map(c => c.descricao + ' — competência ' + br(c.competencia)) });\nconst dataDif = linhas.filter(l => l.status === 'OK_DATA');\nif (dataDif.length) alertas.push({ tipo: 'Data diferente', texto: 'Competência no CA diferente da data da compra na fatura.', itens: dataDif.map(l => l.descricao + ' — fatura ' + br(l.data) + ' / CA ' + br(l.ca.competencia)) });\nconst porNome = {};\nca.forEach(c => { const k = toks(c.descricao).join(' '); if (!k) return; (porNome[k] ||= new Set()).add(c.categoria || '(sem)'); });\nconst incons = Object.entries(porNome).filter(([k, s]) => s.size > 1);\nif (incons.length) alertas.push({ tipo: 'Categoria inconsistente', texto: 'Mesma despesa lançada em categorias diferentes.', itens: incons.map(([k, s]) => k + ': ' + [...s].join(' x ')) });\n\nconst somaCA = Math.round(ca.reduce((s, c) => s + c.valor, 0) * 100) / 100;\nconst cont = s => linhas.filter(l => l.status === s).length;\nconst r = {\n  cliente: F.cliente, arquivo: F.arquivo, banco: F.banco, vencimento: F.vencimento, modo: CFG.modo,\n  totalFatura: F.totalFatura, somaLinhas: F.somaLinhas, somaCA,\n  linhasFatura: linhas.length, lancamentosCA: ca.length, itensTotaisAPI: resp.itens_totais,\n  ok: cont('OK') + cont('OK_DATA') + cont('OK_DIVIDIDO'), valorDif: cont('VALOR_DIF'), falta: cont('FALTA'), faltaParcelaAntiga: cont('FALTA_PARCELA_ANTIGA'),\n  anula: cont('ANULA'), estorno: cont('ESTORNO'), soNoCA: sobras.length,\n  simulacao: simResumo, aLancar: aLancar.length, bloqueios\n};\nr.leituraIA_ok = cents(r.somaLinhas) === cents(r.totalFatura);\nr.fechou = r.valorDif === 0 && r.falta === 0 && r.faltaParcelaAntiga === 0 && r.estorno === 0 && r.soNoCA === 0;\n\n// ---------- Relatório HTML ----------\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst ROT = {\n  OK: ['Confere', '#1b7f3b'], OK_DATA: ['Confere (data diferente)', '#b26a00'], OK_DIVIDIDO: ['Confere (lançado em partes no CA)', '#1b7f3b'], VALOR_DIF: ['Valor diferente', '#c0392b'],\n  FALTA: ['Falta no CA', '#c0392b'], FALTA_PARCELA_ANTIGA: ['Parcela antiga faltando', '#c0392b'],\n  ANULA: ['Cobrança e estorno se anulam', '#666'], ESTORNO: ['Estorno (ver manual)', '#b26a00']\n};\nconst td = 'style=\"padding:4px 6px;border-bottom:1px solid #ddd;font-size:12px;vertical-align:top\"';\nconst tdr = 'style=\"padding:4px 6px;border-bottom:1px solid #ddd;font-size:12px;text-align:right;white-space:nowrap;vertical-align:top\"';\nconst th = 'style=\"padding:4px 6px;border-bottom:2px solid #333;font-size:12px;text-align:left\"';\nconst badge = s => '<span style=\"color:' + ROT[s][1] + ';font-weight:bold\">' + ROT[s][0] + '</span>';\nconst card = (t, v, cor) => '<div style=\"display:inline-block;margin:4px;padding:8px 12px;border:1px solid #ccc;border-radius:6px;min-width:120px\"><div style=\"font-size:11px;color:#555\">' + t + '</div><div style=\"font-size:18px;font-weight:bold;color:' + (cor || '#222') + '\">' + v + '</div></div>';\nconst corPct = p => p >= 95 ? '#1b7f3b' : p >= 80 ? '#b26a00' : '#c0392b';\n\nlet h = '<div style=\"font-family:Arial,sans-serif;text-align:left;max-width:1200px;margin:auto\">';\nh += '<h2 style=\"margin:4px 0\">' + esc(F.cliente) + ' — fatura venc. ' + br(F.vencimento) + '</h2>';\nh += '<p style=\"margin:2px 0;font-size:13px\">' + (r.fechou ? '<b style=\"color:#1b7f3b\">✅ Fatura FECHADA: tudo o que está na fatura está no Conta Azul.</b>' : '<b style=\"color:#c0392b\">⚠️ Há diferenças — veja abaixo.</b>') + '</p>';\nif (CFG.modo === 'lancar' && !podeLancar) h += '<p style=\"color:#c0392b;font-size:13px\"><b>Nada foi lançado.</b> ' + (aLancar.length ? esc(bloqueios.join(' ')) : 'Não há nada faltando no Conta Azul.') + '</p>';\nh += '<div>' + card('Total da fatura', brl(r.totalFatura)) + card('Soma lida pela IA', brl(r.somaLinhas), r.leituraIA_ok ? '#1b7f3b' : '#c0392b') + card('Soma no Conta Azul', brl(r.somaCA), cents(r.somaCA) === cents(r.totalFatura) ? '#1b7f3b' : '#b26a00') + '</div>';\nh += '<div>' + card('Linhas na fatura', r.linhasFatura) + card('Conferem', r.ok, '#1b7f3b') + card('Faltam no CA', r.falta + r.faltaParcelaAntiga, (r.falta + r.faltaParcelaAntiga) ? '#c0392b' : '#1b7f3b') + card('Valor diferente', r.valorDif, r.valorDif ? '#c0392b' : '#1b7f3b') + card('Só no CA', r.soNoCA, r.soNoCA ? '#c0392b' : '#1b7f3b') + '</div>';\nif (!r.leituraIA_ok) h += '<p style=\"color:#c0392b;font-size:12px\">A soma das linhas lidas pela IA não bate com o total da fatura (diferença ' + brl(r.somaLinhas - r.totalFatura) + '). Pode ter linha lida errado.</p>';\nif (r.itensTotaisAPI > 100) h += '<p style=\"color:#c0392b;font-size:12px\">Atenção: o CA tem ' + r.itensTotaisAPI + ' lançamentos nesse vencimento e só os 100 primeiros foram lidos.</p>';\n\nif (aLancar.length) {\n  h += '<h3 style=\"margin-top:18px\">📝 ' + (podeLancar ? 'Lançamentos enviados ao Conta Azul' : 'O robô lançaria (faltam no Conta Azul)') + ': ' + aLancar.length + '</h3><table style=\"border-collapse:collapse;width:100%\"><tr><th ' + th + '>#</th><th ' + th + '>Descrição</th><th ' + th + '>Valor</th><th ' + th + '>Categoria</th><th ' + th + '>Fornecedor</th><th ' + th + '>Centro de custo</th><th ' + th + '>Competência</th><th ' + th + '>Vencimento</th></tr>';\n  aLancar.forEach(a => { h += '<tr><td ' + td + '>' + a.n + '</td><td ' + td + '>' + esc(a.descricao) + '</td><td ' + tdr + '>' + brl(a.valor) + '</td><td ' + td + '>' + esc(a.categoria) + '</td><td ' + td + '>' + esc(a.fornecedor) + (a.fornecedorId ? '' : ' <span style=\"color:#b26a00\">(novo)</span>') + '</td><td ' + td + '>' + esc(a.centroCusto) + '</td><td ' + td + '>' + br(a.competencia) + '</td><td ' + td + '>' + br(a.vencimento) + '</td></tr>'; });\n  h += '</table>';\n}\n\nh += '<h3 style=\"margin-top:18px\">🤖 Simulação: o que o robô lançaria x o que está no Conta Azul</h3>';\nh += '<p style=\"font-size:12px;margin:2px 0\">Aprendeu com ' + simResumo.historico + ' lançamentos de faturas anteriores (' + simResumo.mesesHistorico.map(m => m.split('-').reverse().join('/')).join(', ') + ') + regras combinadas. Em vermelho: o que está diferente no Conta Azul.</p>';\nh += '<div>' + card('Lançamento certo (categoria + fornecedor + data)', simResumo.lancamentoCerto + '%', corPct(simResumo.lancamentoCerto)) + card('Categoria igual', simResumo.categoria + '%', corPct(simResumo.categoria)) + card('Fornecedor igual', simResumo.fornecedor + '%', corPct(simResumo.fornecedor)) + card('Data igual', simResumo.competencia + '%', corPct(simResumo.competencia)) + card('Descrição idêntica', simResumo.descricao + '%', corPct(simResumo.descricao)) + card('Empresas novas', simResumo.semHistorico) + '</div>';\nconst cel = (rob, lai, ok) => esc(rob || '—') + (ok === false ? '<div style=\"color:#c0392b\">No CA: ' + esc(lai || '(vazio)') + '</div>' : '');\nh += '<table style=\"border-collapse:collapse;width:100%\"><tr><th ' + th + '>#</th><th ' + th + '>Fatura</th><th ' + th + '>Valor</th><th ' + th + '>Descrição (robô)</th><th ' + th + '>Categoria</th><th ' + th + '>Fornecedor</th><th ' + th + '>Centro de custo</th><th ' + th + '>Competência</th><th ' + th + '>Resultado</th></tr>';\nsim.forEach(s => {\n  const o = s.ok || {};\n  const L = s.Redacted || {};\n  const res = !s.ok ? '<span style=\"color:#b26a00\">' + (['FALTA', 'FALTA_PARCELA_ANTIGA'].includes(s.status) ? 'Falta no CA' : 'Lançado em partes') + '</span>' : (o.categoria && o.fornecedor && o.competencia) ? '<span style=\"color:#1b7f3b;font-weight:bold\">✔ certo</span>' : '<span style=\"color:#c0392b\">✘ diferente</span>';\n  h += '<tr><td ' + td + '>' + s.n + '</td><td ' + td + '>' + esc(s.fatura) + '<div style=\"color:#888\">' + esc(s.robo.fonte) + '</div></td><td ' + tdr + '>' + brl(s.valor) + '</td><td ' + td + '>' + cel(s.robo.descricao, L.descricao, o.descricao) + '</td><td ' + td + '>' + cel(s.robo.categoria, L.categoria, o.categoria) + '</td><td ' + td + '>' + cel(s.robo.fornecedor, L.fornecedor, o.fornecedor) + '</td><td ' + td + '>' + cel(s.robo.centroCusto, L.centroCusto, o.centroCusto) + '</td><td ' + td + '>' + cel(br(s.robo.competencia), br(L.competencia), o.competencia) + '</td><td ' + td + '>' + res + '</td></tr>';\n});\nh += '</table>';\n\nconst probs = linhas.filter(l => !['OK', 'OK_DIVIDIDO', 'ANULA'].includes(l.status));\nif (probs.length || sobras.length) {\n  h += '<h3>Diferenças fatura x Conta Azul</h3><table style=\"border-collapse:collapse;width:100%\"><tr><th ' + th + '>Situação</th><th ' + th + '>Data</th><th ' + th + '>Fatura</th><th ' + th + '>Valor fatura</th><th ' + th + '>No Conta Azul</th><th ' + th + '>Valor CA</th></tr>';\n  probs.forEach(l => { h += '<tr><td ' + td + '>' + badge(l.status) + '</td><td ' + td + '>' + br(l.data) + '</td><td ' + td + '>' + esc(l.descricao) + ' <span style=\"color:#888\">(final ' + esc(l.final) + ')</span></td><td ' + tdr + '>' + brl(l.valor) + '</td><td ' + td + '>' + esc(l.ca ? l.ca.descricao : '—') + '</td><td ' + tdr + '>' + (l.ca ? brl(l.ca.valor) : '—') + '</td></tr>'; });\n  sobras.forEach(c => { h += '<tr><td ' + td + '><span style=\"color:#c0392b;font-weight:bold\">Só no CA (não está na fatura)</span></td><td ' + td + '>' + br(c.competencia) + '</td><td ' + td + '>—</td><td ' + tdr + '>—</td><td ' + td + '>' + esc(c.descricao) + '</td><td ' + tdr + '>' + brl(c.valor) + '</td></tr>'; });\n  h += '</table>';\n}\n\nif (alertas.length) {\n  h += '<h3>Alertas de qualidade (lançamentos do CA)</h3>';\n  alertas.forEach(a => { h += '<p style=\"margin:6px 0 2px;font-size:13px\"><b>' + esc(a.tipo) + ':</b> ' + esc(a.texto) + '</p><ul style=\"margin:0;font-size:12px\">' + a.itens.slice(0, 30).map(i => '<li>' + esc(i) + '</li>').join('') + '</ul>'; });\n}\nh += '<p style=\"font-size:11px;color:#888\">' + (podeLancar ? 'O robô só CRIA lançamentos que faltam. Nunca apaga nem altera nada.' : 'Modo conferência: o robô só leu dados. Nada foi alterado no Conta Azul.') + '</p></div>';\n\nreturn [{ json: { resumo: r, podeLancar, aLancar, alertas, linhas, sobras, simulacao: sim, html: h } }];"
+      }
+    },
+    {
+      "name": "Mostrar relatório",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        1680,
+        100
+      ],
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $json.html }}"
+      }
+    },
+    {
+      "name": "Sticky Note 832ad69b",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        608,
+        0
+      ],
+      "parameters": {
+        "content": "## Conferência da fatura do cartão (modo sombra)\n\n1. Formulário recebe o PDF da fatura\n2. Gemini lê todas as linhas\n3. Busca no Conta Azul as despesas da conta do cartão com o mesmo vencimento (**só GET**)\n4. Compara linha a linha e mostra o relatório\n\n**Não cria, não altera e não apaga nada no Conta Azul.**\n\nNovo cliente: incluir em \"Config do cliente + PDF\" e no dropdown do formulário.",
+        "color": 5
+      }
+    },
+    {
+      "name": "Conta Azul - histórico do cartão (só leitura)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1008,
+        200
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api-v2.contaazul.com/v1/financeiro/eventos-financeiros/contas-a-pagar/buscar",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "tamanho_pagina",
+              "value": "100"
+            },
+            {
+              "name": "data_vencimento_de",
+              "value": "={{ DateTime.fromISO($('Organizar linhas da fatura').item.json.vencimento).minus({ days: 365 }).toISODate() }}"
+            },
+            {
+              "name": "data_vencimento_ate",
+              "value": "={{ DateTime.fromISO($('Organizar linhas da fatura').item.json.vencimento).minus({ days: 10 }).toISODate() }}"
+            },
+            {
+              "name": "ids_contas_financeiras",
+              "value": "={{ $('Organizar linhas da fatura').item.json.contaCartaoId }}"
+            }
+          ]
+        },
+        "options": {
+          "pagination": {
+            "pagination": {
+              "parameters": {
+                "parameters": [
+                  {
+                    "type": "qs",
+                    "name": "pagina",
+                    "value": "={{ $pageCount + 1 }}"
+                  }
+                ]
+              },
+              "paginationCompleteWhen": "other",
+              "completeExpression": "={{ ($response.body.itens || []).length < 100 }}",
+              "limitPagesFetched": true,
+              "maxRequests": 20
+            }
+          }
+        }
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "oAuth2Api"
+        }
+      }
+    },
+    {
+      "name": "Conta Azul - categorias",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1008,
+        400
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api-v2.contaazul.com/v1/categorias",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "tipo",
+              "value": "DESPESA"
+            },
+            {
+              "name": "tamanho_pagina",
+              "value": "1000"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "oAuth2Api"
+        }
+      }
+    },
+    {
+      "name": "Conta Azul - centros de custo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        400
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api-v2.contaazul.com/v1/centro-de-custo",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "filtro_rapido",
+              "value": "ATIVO"
+            },
+            {
+              "name": "tamanho_pagina",
+              "value": "1000"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "oAuth2Api"
+        }
+      }
+    },
+    {
+      "name": "Lançar no Conta Azul?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1456,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.podeLancar === true && $('Organizar linhas da fatura').first().json.linhas.every(l => /^\\d{4}-\\d{2}-\\d{2}$/.test(l.data || '')) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "name": "Agrupar por fornecedor",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        -200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Um item por fornecedor (evita cadastrar o mesmo fornecedor novo duas vezes)\nconst a = $input.first().json.aLancar || [];\nconst g = {};\na.forEach(x => {\n  const k = x.fornecedorId || ('NOVO:' + String(x.fornecedor).toUpperCase());\n  (g[k] ||= { fornecedor: x.fornecedor, fornecedorId: x.fornecedorId, lancamentos: [] }).lancamentos.push(x);\n});\nreturn Object.values(g).map(v => ({ json: v }));"
+      }
+    },
+    {
+      "name": "Conta Azul - procurar fornecedor",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1904,
+        -200
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://api-v2.contaazul.com/v1/pessoas",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "busca",
+              "value": "={{ $json.fornecedor }}"
+            },
+            {
+              "name": "tipo_perfil",
+              "value": "Fornecedor"
+            },
+            {
+              "name": "tamanho_pagina",
+              "value": "50"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 3,
+              "batchInterval": 1000
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "oAuth2Api"
+        }
+      }
+    },
+    {
+      "name": "Escolher fornecedor",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2128,
+        -200
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const g = $('Agrupar por fornecedor').item.json;\nconst K = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase().replace(/[^A-Z0-9]+/g, '');\nif (g.fornecedorId) return { json: { ...g, precisaCriar: false } };\nconst lista = $json.itens || $json.items || $json.data || $json.content || [];\nconst alvo = K(g.fornecedor);\nconst achou = lista.find(p => K(p.nome) === alvo || K(p.nome_fantasia) === alvo) || lista.find(p => alvo.length >= 5 && (K(p.nome).startsWith(alvo) || K(p.nome_fantasia).startsWith(alvo)));\nreturn { json: { ...g, fornecedorId: achou?.id || '', fornecedorEncontrado: achou?.nome || '', precisaCriar: !achou } };"
+      }
+    },
+    {
+      "name": "Fornecedor novo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2352,
+        -200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.precisaCriar }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "name": "Conta Azul - cadastrar fornecedor",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2576,
+        -300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api-v2.contaazul.com/v1/pessoas",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ nome: $json.fornecedor, tipo_pessoa: 'Jurídica', perfis: [{ tipo_perfil: 'Fornecedor' }], observacao: 'Cadastrado automaticamente pelo robô da fatura do cartão' }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1000
+            }
+          },
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "oAuth2Api"
+        }
+      }
+    },
+    {
+      "name": "Pegar id do fornecedor novo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2800,
+        -300
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const g = $('Escolher fornecedor').item.json;\nconst id = $json.id || $json.uuid || '';\nreturn { json: { ...g, fornecedorId: id, fornecedorCriado: !!id, erroFornecedor: id ? '' : JSON.stringify($json).slice(0, 300) } };"
+      }
+    },
+    {
+      "name": "Juntar fornecedores",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        3024,
+        -200
+      ],
+      "parameters": {}
+    },
+    {
+      "name": "Montar lançamentos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3248,
+        -200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Um item por despesa a criar, no formato do POST /v1/financeiro/eventos-financeiros/contas-a-pagar\nconst out = [];\nfor (const it of $input.all()) {\n  const g = it.json;\n  for (const a of g.lancamentos) {\n    const base = { ...a, fornecedor: g.fornecedor, fornecedorId: g.fornecedorId, fornecedorCriado: !!g.fornecedorCriado };\n    if (!g.fornecedorId) { out.push({ json: { ...base, pular: true, erro: 'Fornecedor não encontrado nem cadastrado: ' + g.fornecedor + ' ' + (g.erroFornecedor || '') } }); continue; }\n    const cc = a.centroCustoId ? [{ id_centro_custo: a.centroCustoId, valor: a.valor }] : [];\n    const obs = 'Lançado automaticamente pelo robô da fatura do cartão (venc. ' + a.vencimento.split('-').reverse().join('/') + ') - ref ' + a.referencia;\n    out.push({ json: { ...base, pular: false, body: {\n      descricao: a.descricao,\n      data_competencia: a.competencia,\n      valor: a.valor,\n      conta_financeira: a.contaCartaoId,\n      contato: g.fornecedorId,\n      observacao: obs,\n      rateio: [{ id_categoria: a.categoriaId, valor: a.valor, rateio_centro_custo: cc }],\n      // O Conta Azul mostra a descrição da PARCELA na lista -> mesma descrição do lançamento\n      condicao_pagamento: { parcelas: [{ descricao: a.descricao, data_vencimento: a.vencimento, nota: '', conta_financeira: a.contaCartaoId, metodo_pagamento: 'CARTAO_CREDITO', detalhe_valor: { valor_bruto: a.valor, valor_liquido: a.valor } }] }\n    } } });\n  }\n}\nreturn out;"
+      }
+    },
+    {
+      "name": "Só os que podem ser criados",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [
+        3472,
+        -200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c3",
+              "leftValue": "={{ $json.pular }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "name": "Conta Azul - CRIAR despesa",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3696,
+        -200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api-v2.contaazul.com/v1/financeiro/eventos-financeiros/contas-a-pagar",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 2,
+              "batchInterval": 1000
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "oAuth2Api"
+        }
+      }
+    },
+    {
+      "name": "Resumo dos lançamentos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3920,
+        -200
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const base = $('Comparar fatura x Conta Azul').first().json;\nconst todos = $('Montar lançamentos').all().map(i => i.json);\nconst filtrados = $('Só os que podem ser criados').all();\nconst enviados = $input.all().map((it, i) => {\n  const a = filtrados[i].json;\n  const st = it.json.statusCode;\n  const body = it.json.body || {};\n  const ok = st >= 200 && st < 300;\n  return { ...a, ok, idCriado: body.id || '', erro: ok ? '' : ('HTTP ' + st + ': ' + JSON.stringify(body).slice(0, 300)) };\n});\nconst pulados = todos.filter(a => a.pular).map(a => ({ ...a, ok: false }));\nconst res = [...enviados, ...pulados].sort((a, b) => a.n - b.n);\nconst okN = res.filter(r => r.ok).length;\nconst soma = res.filter(r => r.ok).reduce((s, r) => s + r.valor, 0);\nconst brl = v => Number(v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });\nconst esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');\nconst td = 'style=\"padding:4px 6px;border-bottom:1px solid #ddd;font-size:12px;vertical-align:top\"';\nconst th = 'style=\"padding:4px 6px;border-bottom:2px solid #333;font-size:12px;text-align:left\"';\nlet h = '<div style=\"font-family:Arial,sans-serif;text-align:left;max-width:1200px;margin:auto\">';\nh += '<h2 style=\"margin:4px 0\">' + (okN === res.length ? '✅' : '⚠️') + ' Lançamento automático: ' + okN + ' de ' + res.length + ' criados no Conta Azul (' + brl(soma) + ')</h2>';\nconst novos = [...new Set(res.filter(r => r.ok && r.fornecedorCriado).map(r => r.fornecedor))];\nif (novos.length) h += '<p style=\"font-size:13px\">Fornecedores cadastrados agora: ' + esc(novos.join(', ')) + '</p>';\nh += '<table style=\"border-collapse:collapse;width:100%\"><tr><th ' + th + '>#</th><th ' + th + '>Descrição</th><th ' + th + '>Valor</th><th ' + th + '>Categoria</th><th ' + th + '>Fornecedor</th><th ' + th + '>Resultado</th></tr>';\nres.forEach(r => { h += '<tr><td ' + td + '>' + r.n + '</td><td ' + td + '>' + esc(r.descricao) + '</td><td ' + td + '>' + brl(r.valor) + '</td><td ' + td + '>' + esc(r.categoria) + '</td><td ' + td + '>' + esc(r.fornecedor) + '</td><td ' + td + '>' + (r.ok ? '<span style=\"color:#1b7f3b;font-weight:bold\">✔ criado</span>' : '<span style=\"color:#c0392b\">✘ ' + esc(r.erro) + '</span>') + '</td></tr>'; });\nh += '</table><hr style=\"margin:20px 0\"></div>';\nreturn [{ json: { criados: okN, total: res.length, resultado: res, html: h + base.html } }];"
+      }
+    },
+    {
+      "name": "Mostrar resultado do lançamento",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        4144,
+        -200
+      ],
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "responseText": "={{ $json.html }}"
+      }
+    }
+  ],
+  "connections": {
+    "Enviar fatura do cartão": {
+      "main": [
+        [
+          {
+            "node": "Config do cliente + PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config do cliente + PDF": {
+      "main": [
+        [
+          {
+            "node": "IA - Gemini lê a fatura",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IA - Gemini lê a fatura": {
+      "main": [
+        [
+          {
+            "node": "Organizar linhas da fatura",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Organizar linhas da fatura": {
+      "main": [
+        [
+          {
+            "node": "Conta Azul - despesas do cartão (só leitura)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conta Azul - despesas do cartão (só leitura)": {
+      "main": [
+        [
+          {
+            "node": "Conta Azul - histórico do cartão (só leitura)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conta Azul - histórico do cartão (só leitura)": {
+      "main": [
+        [
+          {
+            "node": "Conta Azul - categorias",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conta Azul - categorias": {
+      "main": [
+        [
+          {
+            "node": "Conta Azul - centros de custo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conta Azul - centros de custo": {
+      "main": [
+        [
+          {
+            "node": "Comparar fatura x Conta Azul",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Comparar fatura x Conta Azul": {
+      "main": [
+        [
+          {
+            "node": "Lançar no Conta Azul?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lançar no Conta Azul?": {
+      "main": [
+        [
+          {
+            "node": "Agrupar por fornecedor",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mostrar relatório",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Agrupar por fornecedor": {
+      "main": [
+        [
+          {
+            "node": "Conta Azul - procurar fornecedor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conta Azul - procurar fornecedor": {
+      "main": [
+        [
+          {
+            "node": "Escolher fornecedor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escolher fornecedor": {
+      "main": [
+        [
+          {
+            "node": "Fornecedor novo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fornecedor novo?": {
+      "main": [
+        [
+          {
+            "node": "Conta Azul - cadastrar fornecedor",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Juntar fornecedores",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Conta Azul - cadastrar fornecedor": {
+      "main": [
+        [
+          {
+            "node": "Pegar id do fornecedor novo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pegar id do fornecedor novo": {
+      "main": [
+        [
+          {
+            "node": "Juntar fornecedores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Juntar fornecedores": {
+      "main": [
+        [
+          {
+            "node": "Montar lançamentos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar lançamentos": {
+      "main": [
+        [
+          {
+            "node": "Só os que podem ser criados",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Só os que podem ser criados": {
+      "main": [
+        [
+          {
+            "node": "Conta Azul - CRIAR despesa",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conta Azul - CRIAR despesa": {
+      "main": [
+        [
+          {
+            "node": "Resumo dos lançamentos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resumo dos lançamentos": {
+      "main": [
+        [
+          {
+            "node": "Mostrar resultado do lançamento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

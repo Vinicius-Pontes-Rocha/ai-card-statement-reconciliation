@@ -1,0 +1,92 @@
+{
+  "name": "01-upload-portal",
+  "nodes": [
+    {
+      "name": "Portal - escolher cliente",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.5,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "authentication": "basicAuth",
+        "formTitle": "Faturas de cartão - REDACTED",
+        "formDescription": "Escolha o cliente e o cartão. Na próxima tela você envia o PDF da fatura.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Cliente / cartão",
+              "fieldName": "destino",
+              "fieldType": "dropdown",
+              "requiredField": true,
+              "fieldOptions": {
+                "values": [
+                  {
+                    "option": "Redacted Redacted - Sicredi (Omie)"
+                  },
+                  {
+                    "option": "Redacted Redacted - Caixa (Omie)"
+                  },
+                  {
+                    "option": "Redacted Matriz - Itaú (Conta Azul, lança automático)"
+                  },
+                  {
+                    "option": "Redacted Contabilidade (Conta Azul Mais, planilha)"
+                  },
+                  {
+                    "option": "Redacted (Conta Azul Mais, planilha)"
+                  },
+                  {
+                    "option": "Redacted (Conta Azul Mais, planilha)"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "options": {
+          "path": "faturas-cartao",
+          "buttonLabel": "Continuar",
+          "appendAttribution": false
+        }
+      },
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "<CREDENTIAL_ID>",
+          "name": "httpBasicAuth"
+        }
+      }
+    },
+    {
+      "name": "Ir para o formulário do cliente",
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        224,
+        0
+      ],
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "redirect",
+        "redirectUrl": "={{ (() => { const base = '<N8N_HOST_URL>'; const mais = n => 'fatura-conta-azul-mais?cliente=' + encodeURIComponent(n); const m = { 'Redacted Redacted - Sicredi (Omie)': 'conferir-fatura-Redacted-Redacted?cliente=' + encodeURIComponent('Redacted Redacted - Sicredi'), 'Redacted Redacted - Caixa (Omie)': 'conferir-fatura-Redacted-Redacted-caixa', 'Redacted Matriz - Itaú (Conta Azul, lança automático)': 'conferir-fatura-cartao?cliente=' + encodeURIComponent('Redacted Matriz'), 'Redacted Filial (Conta Azul Mais, planilha)': mais('Redacted Filial'), 'Redacted Contabilidade (Conta Azul Mais, planilha)': mais('Redacted Contabilidade'), 'Redacted (Conta Azul Mais, planilha)': mais('Redacted'), 'Redacted (Conta Azul Mais, planilha)': mais('Redacted') }; return base + m[$json.destino]; })() }}"
+      }
+    }
+  ],
+  "connections": {
+    "Portal - escolher cliente": {
+      "main": [
+        [
+          {
+            "node": "Ir para o formulário do cliente",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
